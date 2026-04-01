@@ -129,8 +129,17 @@ def _rel_style(rel_val: str) -> str:
 def main() -> None:
     """[bold]semg[/] — semantic graph for software architecture.
 
-    A CLI tool for agents and humans to sketch, query, and export
-    software architecture as a typed graph.
+    Turns your codebase into a queryable graph of modules, classes, functions,
+    and their relationships. Built for agents and humans.
+
+    \b
+    Quick start:
+      semg init              # initialize in any project
+      semg scan src/         # auto-populate from source (Python/JS/TS/Zig)
+      semg about MyClass     # ask questions
+      semg analyze           # deep architectural analysis
+
+    Output is automatically JSON when piped, rich text in terminal.
     """
     pass
 
@@ -140,7 +149,11 @@ def main() -> None:
 
 @main.command()
 def init() -> None:
-    """Initialize [bold].semg/[/] in the current directory."""
+    """Initialize [bold].semg/[/] in the current directory.
+
+    Creates a .semg/ directory with an empty graph. Run this once per project,
+    then use [bold]semg scan[/] to populate.
+    """
     root = init_project()
     console.print(f"[green]Initialized[/] .semg/ in {root}")
 
@@ -153,7 +166,16 @@ def init() -> None:
 @click.option("--doc", default=None, help="Docstring / description")
 @click.option("--meta", multiple=True, help="KEY=VALUE metadata (repeatable)")
 def add(type: str, name: str, file_: str | None, line: int | None, doc: str | None, meta: tuple[str, ...]) -> None:
-    """Add a node to the graph."""
+    """Add a node to the graph (upserts if it already exists).
+
+    \b
+    Node types: package, module, class, function, method, interface,
+                variable, constant, type, endpoint, config (or any custom string)
+    Examples:
+      semg add module app.auth
+      semg add class app.auth.AuthService --file src/auth.py --line 12
+      semg add endpoint /api/login --doc "Login endpoint" --meta method=POST
+    """
     graph, root = _load()
     metadata = _parse_meta(meta)
     metadata.setdefault("source", "manual")
@@ -176,7 +198,17 @@ def add(type: str, name: str, file_: str | None, line: int | None, doc: str | No
 @click.argument("target")
 @click.option("--meta", multiple=True, help="KEY=VALUE metadata (repeatable)")
 def link(source: str, rel: str, target: str, meta: tuple[str, ...]) -> None:
-    """Add an edge between two nodes."""
+    """Add a typed edge between two nodes.
+
+    \b
+    Relationship types: calls, inherits, implements, contains, depends_on,
+                        imports, returns, accepts, overrides, decorates, tests
+                        (or any custom string)
+    Examples:
+      semg link app.auth calls app.db
+      semg link app.auth.Service inherits app.base.Base
+      semg link app.routes depends_on app.auth
+    """
     graph, root = _load()
     source = _resolve_or_exit(graph, source)
     target = _resolve_or_exit(graph, target)
@@ -195,7 +227,10 @@ def link(source: str, rel: str, target: str, meta: tuple[str, ...]) -> None:
 @main.command()
 @click.argument("name")
 def rm(name: str) -> None:
-    """Remove a node and all its edges."""
+    """Remove a node and all its edges (cascade delete).
+
+    Short names work: [bold]semg rm AuthService[/] resolves to the full name if unambiguous.
+    """
     graph, root = _load()
     name = _resolve_or_exit(graph, name)
     try:
@@ -212,7 +247,11 @@ def rm(name: str) -> None:
 @click.argument("rel")
 @click.argument("target")
 def unlink(source: str, rel: str, target: str) -> None:
-    """Remove an edge."""
+    """Remove a specific edge.
+
+    \b
+    Example: semg unlink app.auth calls app.db
+    """
     graph, root = _load()
     source = _resolve_or_exit(graph, source)
     target = _resolve_or_exit(graph, target)
@@ -233,7 +272,11 @@ def unlink(source: str, rel: str, target: str) -> None:
 @click.option("--doc", default=None, help="Docstring / description")
 @click.option("--meta", multiple=True, help="KEY=VALUE metadata (repeatable)")
 def update(name: str, type_: str | None, file_: str | None, line: int | None, doc: str | None, meta: tuple[str, ...]) -> None:
-    """Update a node's fields."""
+    """Update a node's fields (only specified fields are changed).
+
+    \b
+    Example: semg update app.auth --doc "Auth module" --meta owner=alice
+    """
     graph, root = _load()
     name = _resolve_or_exit(graph, name)
     node = graph.get_node(name)
@@ -260,7 +303,15 @@ def update(name: str, type_: str | None, file_: str | None, line: int | None, do
 @click.option("--depth", default=1, type=click.IntRange(0, 2), help="Detail level: 0=identity, 1=connections, 2=neighborhood")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def about(name: str, depth: int, fmt: str | None) -> None:
-    """What is X? Progressive context card for a node."""
+    """What is X? Progressive context card for a node.
+
+    \b
+    Depth controls how much detail:
+      --depth 0  Identity only (name, type, file, docstring)
+      --depth 1  + connections (incoming/outgoing edges, containment path)
+      --depth 2  + 2-hop neighborhood (all nearby nodes)
+    Short names work: semg about SemGraph → semg.graph.SemGraph
+    """
     import json as json_mod
 
     graph, _root = _load()
@@ -344,7 +395,14 @@ def about(name: str, depth: int, fmt: str | None) -> None:
 @click.option("--depth", default=None, type=int, help="Max traversal depth")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def impact(name: str, depth: int | None, fmt: str | None) -> None:
-    """What breaks if I change X? Reverse transitive impact analysis."""
+    """What breaks if I change X? Reverse transitive impact analysis.
+
+    Follows ALL incoming edges (calls, imports, contains, etc.) transitively
+    to find every node that could be affected by a change to X.
+
+    \b
+    Example: semg impact auth.service
+    """
     import json as json_mod
 
     graph, _root = _load()
@@ -377,7 +435,11 @@ def impact(name: str, depth: int | None, fmt: str | None) -> None:
 @click.argument("b")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def between(a: str, b: str, fmt: str | None) -> None:
-    """How do A and B relate? Shortest path + direct edges."""
+    """How do A and B relate? Shortest path + direct edges.
+
+    \b
+    Example: semg between api.routes db.models
+    """
     import json as json_mod
 
     graph, _root = _load()
@@ -417,7 +479,11 @@ def between(a: str, b: str, fmt: str | None) -> None:
 @click.option("--top", "top_n", default=10, type=int, help="Number of top connected nodes to show")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def overview(top_n: int, fmt: str | None) -> None:
-    """Orient me. High-level summary of the graph."""
+    """Orient me. High-level summary of the graph.
+
+    Shows node/edge counts, the most connected nodes (by total incoming +
+    outgoing edges), and modules ranked by size.
+    """
     import json as json_mod
 
     graph, _root = _load()
@@ -489,7 +555,11 @@ def overview(top_n: int, fmt: str | None) -> None:
 @click.argument("name")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def show(name: str, fmt: str | None) -> None:
-    """Show a node and its connections."""
+    """Show a node's details, connections, and metrics.
+
+    Short names work: [bold]semg show SemGraph[/] resolves if unambiguous.
+    Functions/methods include cyclomatic complexity, fan-in/fan-out, etc.
+    """
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     node = graph.get_node(name)
@@ -536,7 +606,13 @@ def show(name: str, fmt: str | None) -> None:
 @click.option("--type", "type_", default=None, help="Filter by node type")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def list_nodes(type_: str | None, fmt: str | None) -> None:
-    """List all nodes."""
+    """List all nodes in the graph.
+
+    \b
+    Filter by type: semg list --type class
+    Valid types: package, module, class, function, method, interface,
+                 variable, constant, type, endpoint, config
+    """
     graph, _root = _load()
     nodes = graph.all_nodes(type=type_)
     fmt = _auto_fmt(fmt)
@@ -575,7 +651,7 @@ def list_nodes(type_: str | None, fmt: str | None) -> None:
 @main.command()
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def status(fmt: str | None) -> None:
-    """Show graph summary."""
+    """Show graph summary — node/edge counts broken down by type."""
     graph, _root = _load()
     nodes = graph.all_nodes()
     edges = graph.all_edges()
@@ -623,7 +699,10 @@ def status(fmt: str | None) -> None:
 
 @main.group()
 def query_cmd() -> None:
-    """Query the graph."""
+    """Low-level graph queries — deps, callers, paths, subgraphs, edges.
+
+    For high-level questions, try [bold]about[/], [bold]impact[/], or [bold]between[/] instead.
+    """
     pass
 
 
@@ -635,7 +714,7 @@ main.add_command(query_cmd, "query")
 @click.option("--depth", default=None, type=int, help="Max traversal depth")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json", "mermaid", "dot"]), help="Output format (auto-detects: JSON when piped)")
 def query_deps(name: str, depth: int | None, fmt: str | None) -> None:
-    """Transitive dependencies of a node."""
+    """Transitive dependencies of a node (follows imports/depends_on edges)."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
@@ -648,7 +727,7 @@ def query_deps(name: str, depth: int | None, fmt: str | None) -> None:
 @click.option("--depth", default=None, type=int, help="Max traversal depth")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json", "mermaid", "dot"]), help="Output format (auto-detects: JSON when piped)")
 def query_callers(name: str, depth: int | None, fmt: str | None) -> None:
-    """What calls this node (transitively)."""
+    """What calls this node (transitively, follows incoming calls edges)."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
@@ -697,7 +776,7 @@ def query_subgraph(name: str, depth: int, fmt: str | None) -> None:
 @click.option("--rel", default=None, help="Filter by relationship type")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def query_incoming(name: str, rel: str | None, fmt: str | None) -> None:
-    """Incoming edges to a node."""
+    """Incoming edges to a node. Filter with --rel calls, --rel imports, etc."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
@@ -710,7 +789,7 @@ def query_incoming(name: str, rel: str | None, fmt: str | None) -> None:
 @click.option("--rel", default=None, help="Filter by relationship type")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
 def query_outgoing(name: str, rel: str | None, fmt: str | None) -> None:
-    """Outgoing edges from a node."""
+    """Outgoing edges from a node. Filter with --rel calls, --rel imports, etc."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
@@ -723,28 +802,35 @@ def query_outgoing(name: str, rel: str | None, fmt: str | None) -> None:
 
 @main.group("export")
 def export_cmd() -> None:
-    """Export the full graph."""
+    """Export the full graph in various formats.
+
+    \b
+    Examples:
+      semg export mermaid                         # paste into markdown
+      semg export dot | dot -Tpng -o graph.png    # render with Graphviz
+      semg export json --indent > graph.json      # machine-readable
+    """
     pass
 
 
 @export_cmd.command("json")
 @click.option("--indent/--no-indent", default=False, help="Pretty print")
 def export_json(indent: bool) -> None:
-    """Export graph as JSON."""
+    """Export graph as JSON ({nodes: [...], edges: [...]})."""
     graph, _root = _load()
     click.echo(export.to_json(graph, indent=indent))
 
 
 @export_cmd.command("mermaid")
 def export_mermaid() -> None:
-    """Export graph as Mermaid flowchart."""
+    """Export graph as Mermaid flowchart (paste into markdown or live editor)."""
     graph, _root = _load()
     click.echo(export.to_mermaid(graph))
 
 
 @export_cmd.command("dot")
 def export_dot() -> None:
-    """Export graph as Graphviz DOT."""
+    """Export graph as Graphviz DOT (pipe to dot, neato, fdp, etc.)."""
     graph, _root = _load()
     click.echo(export.to_dot(graph))
 
@@ -761,7 +847,7 @@ def export_text() -> None:
 
 @main.command()
 def validate() -> None:
-    """Check graph integrity."""
+    """Check graph integrity (dangling edges, missing nodes)."""
     graph, _root = _load()
     issues = graph.validate()
     if not issues:
@@ -1058,9 +1144,18 @@ def analyze(top_n: int, fmt: str | None) -> None:
 def scan(paths: tuple[str, ...], clean: bool, changed: bool, since: str | None, exclude: tuple[str, ...], fmt: str | None) -> None:
     """Scan source files with tree-sitter and populate the graph.
 
-    Use --changed to only rescan files modified since the last commit.
-    Use --since REF to rescan files changed since a specific git ref.
-    Both imply --clean (scoped to changed files only).
+    \b
+    Supported: Python (.py), JavaScript (.js/.jsx), TypeScript (.ts/.tsx), Zig (.zig)
+    Extracts: classes, functions, methods, constants, containment, imports,
+              inheritance, call graph, and per-function complexity metrics.
+
+    \b
+    Examples:
+      semg scan src/                 # full scan
+      semg scan src/ --clean         # remove stale nodes, then rescan
+      semg scan --changed            # only files changed since last commit
+      semg scan --since HEAD~3       # only files changed in last 3 commits
+    Manual nodes/edges (source=manual) are preserved across --clean rescans.
     """
     try:
         from semg.scan import changed_files, scan_paths
@@ -1189,9 +1284,9 @@ def watch(paths: tuple[str, ...], debounce: float) -> None:
 def batch(fmt: str | None) -> None:
     """Execute JSONL commands from stdin in one load/save cycle.
 
-    Each line is a JSON object with an "op" field and operation-specific fields.
-    This is much faster than running individual CLI commands when making many
-    mutations, since the graph is only loaded and saved once.
+    Much faster than individual commands for bulk mutations — the graph is
+    loaded and saved only once. Partial failure tolerant: errors on individual
+    lines are reported but don't stop processing.
 
     \b
     Supported operations:
