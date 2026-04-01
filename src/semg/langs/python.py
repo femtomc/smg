@@ -4,6 +4,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node as TSNode, Parser
 
 from semg.langs import ExtractResult, register
+from semg.metrics import PYTHON_BRANCH_MAP, compute_metrics
 from semg.model import Edge, Node, NodeType, RelType
 
 _LANGUAGE = Language(tspython.language())
@@ -26,6 +27,7 @@ _BUILTINS = frozenset({
 
 class PythonExtractor:
     extensions = [".py"]
+    branch_map = PYTHON_BRANCH_MAP
 
     def extract(self, source: bytes, file_path: str, module_name: str) -> ExtractResult:
         tree = _PARSER.parse(source)
@@ -143,12 +145,16 @@ class PythonExtractor:
         params = node.child_by_field_name("parameters")
         is_method = self._has_self_or_cls(params)
 
+        # Compute AST metrics
+        metrics = compute_metrics(node, self.branch_map)
+
         out_nodes.append(Node(
             name=qualified,
             type=NodeType.METHOD if is_method else NodeType.FUNCTION,
             file=file_path,
             line=node.start_point[0] + 1,
             docstring=self._get_docstring(node),
+            metadata={"metrics": metrics.to_dict()},
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 

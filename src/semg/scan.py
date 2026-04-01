@@ -253,6 +253,16 @@ def scan_paths(
             graph.add_edge(edge)
             stats.edges_added += 1
 
+    # Post-pass: compute fan-in/fan-out for functions and methods
+    for node in graph.all_nodes():
+        if node.type.value in ("function", "method"):
+            fan_in = len(graph.incoming(node.name, rel=RelType.CALLS))
+            fan_out = len(graph.outgoing(node.name, rel=RelType.CALLS))
+            node.metadata.setdefault("metrics", {}).update({
+                "fan_in": fan_in,
+                "fan_out": fan_out,
+            })
+
     return stats
 
 

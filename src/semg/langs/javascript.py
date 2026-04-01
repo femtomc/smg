@@ -10,6 +10,7 @@ from __future__ import annotations
 from tree_sitter import Language, Node as TSNode, Parser
 
 from semg.langs import ExtractResult, register
+from semg.metrics import JS_BRANCH_MAP, compute_metrics
 from semg.model import Edge, Node, NodeType, RelType
 
 # Common JS/TS builtins to skip
@@ -137,12 +138,15 @@ class _JSExtractorBase:
         method_name = name_node.text.decode()
         qualified = f"{class_name}.{method_name}"
 
+        metrics = compute_metrics(node, JS_BRANCH_MAP)
+
         out_nodes.append(Node(
             name=qualified,
             type=NodeType.METHOD,
             file=file_path,
             line=node.start_point[0] + 1,
             docstring=self._get_jsdoc(node),
+            metadata={"metrics": metrics.to_dict()},
         ))
         out_edges.append(Edge(source=class_name, target=qualified, rel=RelType.CONTAINS))
 
@@ -165,12 +169,15 @@ class _JSExtractorBase:
         func_name = name_node.text.decode()
         qualified = f"{parent_name}.{func_name}"
 
+        metrics = compute_metrics(node, JS_BRANCH_MAP)
+
         out_nodes.append(Node(
             name=qualified,
             type=NodeType.FUNCTION,
             file=file_path,
             line=node.start_point[0] + 1,
             docstring=self._get_jsdoc(node),
+            metadata={"metrics": metrics.to_dict()},
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
@@ -354,6 +361,7 @@ class _JSExtractorBase:
 
 class JavaScriptExtractor(_JSExtractorBase):
     extensions = [".js", ".jsx", ".mjs", ".cjs"]
+    branch_map = JS_BRANCH_MAP
 
     def __init__(self) -> None:
         import tree_sitter_javascript as tsjs
@@ -366,6 +374,7 @@ class JavaScriptExtractor(_JSExtractorBase):
 
 class TypeScriptExtractor(_JSExtractorBase):
     extensions = [".ts"]
+    branch_map = JS_BRANCH_MAP
 
     def __init__(self) -> None:
         import tree_sitter_typescript as tsts
@@ -378,6 +387,7 @@ class TypeScriptExtractor(_JSExtractorBase):
 
 class TSXExtractor(_JSExtractorBase):
     extensions = [".tsx"]
+    branch_map = JS_BRANCH_MAP
 
     def __init__(self) -> None:
         import tree_sitter_typescript as tsts

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from semg.model import Edge, Node
+
+if TYPE_CHECKING:
+    from semg.metrics import BranchMap
 
 
 @dataclass
@@ -15,6 +18,7 @@ class ExtractResult:
 @runtime_checkable
 class LanguageExtractor(Protocol):
     extensions: list[str]
+    branch_map: BranchMap
 
     def extract(self, source: bytes, file_path: str, module_name: str) -> ExtractResult: ...
 
