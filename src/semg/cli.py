@@ -1059,23 +1059,46 @@ def analyze(top_n: int, fmt: str | None) -> None:
     graph, _root = _load()
     fmt = _auto_fmt(fmt)
 
+    use_progress = fmt == "text" and sys.stdout.isatty()
+    if use_progress:
+        from rich.progress import Progress, SpinnerColumn, TextColumn
+        progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"), console=console, transient=True)
+        progress.start()
+        task_id = progress.add_task("Analyzing...")
+
+    def _step(desc: str):
+        if use_progress:
+            progress.update(task_id, description=desc)
+
     # Graph-theoretic
+    _step("Finding cycles...")
     cycles = graph_metrics.find_cycles(graph)
+    _step("Computing layers...")
     layers = graph_metrics.topological_layers(graph)
+    _step("Computing PageRank...")
     pr = graph_metrics.pagerank(graph)
+    _step("Computing betweenness centrality...")
     bc = graph_metrics.betweenness_centrality(graph)
+    _step("Computing k-core decomposition...")
     kc = graph_metrics.kcore_decomposition(graph)
+    _step("Detecting bridges...")
     bridges = graph_metrics.detect_bridges(graph)
 
     # OO metrics
+    _step("Computing class metrics (CK suite)...")
     wmc_data = oo_metrics.wmc(graph)
     dit_data = oo_metrics.dit(graph)
     noc_data = oo_metrics.noc(graph)
     cbo_data = oo_metrics.cbo(graph)
     rfc_data = oo_metrics.rfc(graph)
     lcom_data = oo_metrics.lcom4(graph)
+    _step("Computing module metrics (Martin)...")
     martin_data = oo_metrics.martin_metrics(graph)
+    _step("Checking SDP violations...")
     sdp = oo_metrics.sdp_violations(graph)
+
+    if use_progress:
+        progress.stop()
 
     # Summaries
     max_layer = max(layers.values()) if layers else 0
@@ -1263,9 +1286,33 @@ def scan(paths: tuple[str, ...], clean: bool, changed: bool, since: str | None, 
     else:
         scan_dirs = [Path(p).resolve() for p in paths] if paths else [Path.cwd().resolve()]
 
-    stats = scan_paths(graph, root, scan_dirs, clean=clean, excludes=list(exclude) or None)
-    save_graph(graph, root)
     fmt = _auto_fmt(fmt)
+
+    # Progress callback for text mode
+    progress_cb = None
+    if fmt == "text" and sys.stdout.isatty():
+        from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(bar_width=30),
+            MofNCompleteColumn(),
+            console=console,
+            transient=True,
+        )
+        progress.start()
+        task_id = progress.add_task("Scanning...", total=None)
+
+        def progress_cb(current, total, file_path):
+            progress.update(task_id, total=total, completed=current, description=f"[dim]{file_path}[/]")
+
+    stats = scan_paths(graph, root, scan_dirs, clean=clean, excludes=list(exclude) or None, on_progress=progress_cb)
+
+    if progress_cb is not None:
+        progress.stop()
+
+    save_graph(graph, root)
 
     if fmt == "json":
         import json

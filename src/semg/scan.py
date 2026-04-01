@@ -147,6 +147,7 @@ def scan_paths(
     paths: list[Path],
     clean: bool = False,
     excludes: list[str] | None = None,
+    on_progress: Any = None,
 ) -> ScanStats:
     """Scan source files and populate the graph."""
     load_extractors()
@@ -188,7 +189,7 @@ def scan_paths(
     all_edges: list[Edge] = []
     module_names: set[str] = set()
 
-    for fpath in files:
+    for file_idx, fpath in enumerate(files):
         ext = fpath.suffix
         extractor = get_extractor(ext)
         if extractor is None:
@@ -199,6 +200,9 @@ def scan_paths(
             rel_path = str(fpath.relative_to(root))
         except ValueError:
             rel_path = str(fpath)
+
+        if on_progress:
+            on_progress(file_idx + 1, len(files), rel_path)
         module_name = file_to_module_name(rel_path, root)
         module_names.add(module_name)
 
