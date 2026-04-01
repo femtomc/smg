@@ -47,3 +47,7 @@ def load_extractors() -> None:
         from semg.langs import javascript as _  # noqa: F401, F811
     except ImportError:
         pass
+    try:
+        from semg.langs import zig as _  # noqa: F401, F811
+    except ImportError:
+        pass
