@@ -56,19 +56,39 @@ def file_to_module_name(file_path: str, root: Path) -> str:
     # Detect src-layout: if first component is "src" and there's a package underneath
     if len(parts) > 1 and parts[0] == "src":
         candidate = root / "src" / parts[1]
-        if candidate.is_dir() and (candidate / "__init__.py").exists():
-            parts = parts[1:]
+        if candidate.is_dir():
+            # Python: __init__.py signals a package
+            # JS/TS: any directory under src/ is treated as a module root
+            has_py_init = (candidate / "__init__.py").exists()
+            has_js_marker = (
+                (root / "package.json").exists()
+                or (root / "tsconfig.json").exists()
+            )
+            if has_py_init or has_js_marker:
+                parts = parts[1:]
 
-    # Strip .py extension from last part
+    # Strip known extensions from last part
     last = parts[-1]
-    if last.endswith(".py"):
-        last = last[:-3]
-        if last == "__init__":
+    stripped = _strip_extension(last)
+    if stripped is not None:
+        # index.ts / index.js / __init__.py -> parent directory name
+        if stripped in ("__init__", "index"):
             parts = parts[:-1]
         else:
-            parts[-1] = last
+            parts[-1] = stripped
 
     return ".".join(parts)
+
+
+_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _strip_extension(filename: str) -> str | None:
+    """Strip a known extension, returning the stem. Returns None if no match."""
+    for ext in _EXTENSIONS:
+        if filename.endswith(ext):
+            return filename[: -len(ext)]
+    return None
 
 
 def collect_files(
@@ -163,8 +183,8 @@ def scan_paths(
         module_name = file_to_module_name(rel_path, root)
         module_names.add(module_name)
 
-        # Create the module node (__init__.py -> PACKAGE, else MODULE)
-        is_init = fpath.name == "__init__.py"
+        # Create the module node (__init__.py / index.ts / index.js -> PACKAGE, else MODULE)
+        is_init = fpath.stem in ("__init__", "index")
         all_nodes.append(Node(
             name=module_name,
             type=NodeType.PACKAGE if is_init else NodeType.MODULE,

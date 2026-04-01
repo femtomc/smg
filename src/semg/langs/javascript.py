@@ -1,0 +1,408 @@
+"""JavaScript and TypeScript extractor.
+
+Handles .js, .jsx, .ts, .tsx files. The tree-sitter ASTs for JS and TS
+are nearly identical — classes, functions, methods, calls, and imports
+use the same node types. The main difference is TS has type annotations,
+interface declarations, and uses type_identifier for class names.
+"""
+from __future__ import annotations
+
+from tree_sitter import Language, Node as TSNode, Parser
+
+from semg.langs import ExtractResult, register
+from semg.model import Edge, Node, NodeType, RelType
+
+# Common JS/TS builtins to skip
+_BUILTINS = frozenset({
+    "console", "require", "setTimeout", "setInterval", "clearTimeout",
+    "clearInterval", "Promise", "JSON", "Math", "Object", "Array",
+    "String", "Number", "Boolean", "Date", "RegExp", "Error",
+    "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Proxy", "Reflect",
+    "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI",
+    "decodeURI", "encodeURIComponent", "decodeURIComponent",
+    "fetch", "alert", "confirm", "prompt",
+    "TypeError", "RangeError", "ReferenceError", "SyntaxError",
+})
+
+
+def _get_class_name(node: TSNode) -> str | None:
+    """Extract class name — handles both identifier (JS) and type_identifier (TS)."""
+    name = node.child_by_field_name("name")
+    if name is not None:
+        return name.text.decode()
+    return None
+
+
+class _JSExtractorBase:
+    """Shared extraction logic for JS and TS."""
+
+    def _extract(self, parser: Parser, source: bytes, file_path: str, module_name: str) -> ExtractResult:
+        tree = parser.parse(source)
+        nodes: list[Node] = []
+        edges: list[Edge] = []
+        self._walk_body(tree.root_node, module_name, file_path, nodes, edges)
+        self._extract_imports(tree.root_node, module_name, edges)
+        return ExtractResult(nodes=nodes, edges=edges)
+
+    def _walk_body(
+        self,
+        body_node: TSNode,
+        parent_name: str,
+        file_path: str,
+        nodes: list[Node],
+        edges: list[Edge],
+    ) -> None:
+        for child in body_node.children:
+            if child.type == "class_declaration":
+                self._extract_class(child, parent_name, file_path, nodes, edges)
+            elif child.type == "function_declaration":
+                self._extract_function(child, parent_name, file_path, nodes, edges)
+            elif child.type == "export_statement":
+                # Unwrap: export class X {}, export function f() {}, export default ...
+                for inner in child.children:
+                    if inner.type == "class_declaration":
+                        self._extract_class(inner, parent_name, file_path, nodes, edges)
+                    elif inner.type == "function_declaration":
+                        self._extract_function(inner, parent_name, file_path, nodes, edges)
+                    elif inner.type == "lexical_declaration":
+                        self._extract_const(inner, parent_name, file_path, nodes, edges)
+            elif child.type == "lexical_declaration":
+                self._extract_const(child, parent_name, file_path, nodes, edges)
+            elif child.type == "interface_declaration":
+                self._extract_interface(child, parent_name, file_path, nodes, edges)
+
+    def _extract_class(
+        self,
+        node: TSNode,
+        parent_name: str,
+        file_path: str,
+        out_nodes: list[Node],
+        out_edges: list[Edge],
+    ) -> None:
+        class_name = _get_class_name(node)
+        if class_name is None:
+            return
+        qualified = f"{parent_name}.{class_name}"
+
+        out_nodes.append(Node(
+            name=qualified,
+            type=NodeType.CLASS,
+            file=file_path,
+            line=node.start_point[0] + 1,
+            docstring=self._get_jsdoc(node),
+        ))
+        out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
+
+        # Inheritance: extends clause
+        heritage = node.child_by_field_name("heritage") or _find_child(node, "class_heritage")
+        if heritage is not None:
+            for child in heritage.children:
+                if child.type == "extends_clause":
+                    for ident in child.children:
+                        if ident.type in ("identifier", "type_identifier"):
+                            out_edges.append(Edge(
+                                source=qualified,
+                                target=ident.text.decode(),
+                                rel=RelType.INHERITS,
+                                metadata={"unresolved": True},
+                            ))
+                elif child.type == "implements_clause":
+                    for ident in child.children:
+                        if ident.type in ("identifier", "type_identifier"):
+                            out_edges.append(Edge(
+                                source=qualified,
+                                target=ident.text.decode(),
+                                rel=RelType.IMPLEMENTS,
+                                metadata={"unresolved": True},
+                            ))
+
+        # Walk class body for methods
+        body = node.child_by_field_name("body")
+        if body is not None:
+            for child in body.children:
+                if child.type == "method_definition":
+                    self._extract_method(child, qualified, file_path, out_nodes, out_edges)
+
+    def _extract_method(
+        self,
+        node: TSNode,
+        class_name: str,
+        file_path: str,
+        out_nodes: list[Node],
+        out_edges: list[Edge],
+    ) -> None:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        method_name = name_node.text.decode()
+        qualified = f"{class_name}.{method_name}"
+
+        out_nodes.append(Node(
+            name=qualified,
+            type=NodeType.METHOD,
+            file=file_path,
+            line=node.start_point[0] + 1,
+            docstring=self._get_jsdoc(node),
+        ))
+        out_edges.append(Edge(source=class_name, target=qualified, rel=RelType.CONTAINS))
+
+        # Extract calls from method body
+        body = node.child_by_field_name("body")
+        if body is not None:
+            self._extract_calls(body, qualified, class_name, out_edges)
+
+    def _extract_function(
+        self,
+        node: TSNode,
+        parent_name: str,
+        file_path: str,
+        out_nodes: list[Node],
+        out_edges: list[Edge],
+    ) -> None:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        func_name = name_node.text.decode()
+        qualified = f"{parent_name}.{func_name}"
+
+        out_nodes.append(Node(
+            name=qualified,
+            type=NodeType.FUNCTION,
+            file=file_path,
+            line=node.start_point[0] + 1,
+            docstring=self._get_jsdoc(node),
+        ))
+        out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
+
+        # Extract calls from function body
+        body = node.child_by_field_name("body")
+        if body is not None:
+            self._extract_calls(body, qualified, None, out_edges)
+
+    def _extract_const(
+        self,
+        node: TSNode,
+        parent_name: str,
+        file_path: str,
+        out_nodes: list[Node],
+        out_edges: list[Edge],
+    ) -> None:
+        """Extract const/let declarations — only UPPER_CASE as constants."""
+        for child in node.children:
+            if child.type != "variable_declarator":
+                continue
+            name_node = child.child_by_field_name("name")
+            if name_node is None or name_node.type != "identifier":
+                continue
+            var_name = name_node.text.decode()
+            if not var_name.isupper():
+                continue
+            qualified = f"{parent_name}.{var_name}"
+            out_nodes.append(Node(
+                name=qualified,
+                type=NodeType.CONSTANT,
+                file=file_path,
+                line=child.start_point[0] + 1,
+            ))
+            out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
+
+    def _extract_interface(
+        self,
+        node: TSNode,
+        parent_name: str,
+        file_path: str,
+        out_nodes: list[Node],
+        out_edges: list[Edge],
+    ) -> None:
+        """Extract TypeScript interface declarations."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        iface_name = name_node.text.decode()
+        qualified = f"{parent_name}.{iface_name}"
+        out_nodes.append(Node(
+            name=qualified,
+            type=NodeType.INTERFACE,
+            file=file_path,
+            line=node.start_point[0] + 1,
+        ))
+        out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
+
+    def _extract_imports(
+        self,
+        root: TSNode,
+        module_name: str,
+        out_edges: list[Edge],
+    ) -> None:
+        """Extract import statements as IMPORTS edges."""
+        for child in root.children:
+            if child.type == "import_statement":
+                # import X from "source" / import { X } from "source"
+                source = child.child_by_field_name("source")
+                if source is not None:
+                    target = self._import_source_to_module(source)
+                    if target:
+                        out_edges.append(Edge(
+                            source=module_name,
+                            target=target,
+                            rel=RelType.IMPORTS,
+                            metadata={"unresolved": True},
+                        ))
+
+    def _import_source_to_module(self, source_node: TSNode) -> str | None:
+        """Convert an import source string node to a module name.
+
+        './utils' -> 'utils', '../lib/core' -> 'lib.core', 'express' -> 'express'
+        """
+        # Get the string content
+        for child in source_node.children:
+            if child.type == "string_fragment":
+                raw = child.text.decode()
+                # Strip relative prefixes
+                path = raw.lstrip("./")
+                if not path:
+                    return None
+                # Convert path separators to dots, strip extensions
+                for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+                    if path.endswith(ext):
+                        path = path[: -len(ext)]
+                return path.replace("/", ".")
+        return None
+
+    def _extract_calls(
+        self,
+        node: TSNode,
+        caller_name: str,
+        class_name: str | None,
+        out_edges: list[Edge],
+    ) -> None:
+        """Recursively walk AST and extract call edges."""
+        if node.type == "call_expression":
+            func_node = node.child_by_field_name("function")
+            if func_node is not None:
+                result = self._call_target(func_node, class_name)
+                if result is not None:
+                    target, resolved = result
+                    metadata = {} if resolved else {"unresolved": True}
+                    out_edges.append(Edge(
+                        source=caller_name,
+                        target=target,
+                        rel=RelType.CALLS,
+                        metadata=metadata,
+                    ))
+        for child in node.children:
+            if child.type in ("function_declaration", "class_declaration", "arrow_function"):
+                continue
+            self._extract_calls(child, caller_name, class_name, out_edges)
+
+    def _call_target(self, func_node: TSNode, class_name: str | None) -> tuple[str, bool] | None:
+        """Resolve a call's function node to (target_name, is_resolved)."""
+        if func_node.type == "identifier":
+            name = func_node.text.decode()
+            if name in _BUILTINS:
+                return None
+            return (name, False)
+
+        if func_node.type == "member_expression":
+            obj = func_node.child_by_field_name("object")
+            prop = func_node.child_by_field_name("property")
+            if obj is None or prop is None:
+                return None
+            prop_name = prop.text.decode()
+
+            # this.method() -> ClassName.method
+            if obj.type == "this" and class_name:
+                return (f"{class_name}.{prop_name}", True)
+
+            # super.method() -> skip
+            if obj.type == "super":
+                return None
+
+            # console.log, etc — skip known builtins
+            if obj.type == "identifier" and obj.text.decode() in _BUILTINS:
+                return None
+
+            # obj.method() -> "obj.method" (unresolved)
+            if obj.type == "identifier":
+                return (f"{obj.text.decode()}.{prop_name}", False)
+
+            # deeper member_expression: a.b.c() -> "a.b.c"
+            if obj.type == "member_expression":
+                return (f"{obj.text.decode()}.{prop_name}", False)
+
+        return None
+
+    def _get_jsdoc(self, node: TSNode) -> str | None:
+        """Extract JSDoc comment preceding a node."""
+        # Look for a comment sibling immediately before this node
+        prev = node.prev_named_sibling
+        if prev is not None and prev.type == "comment":
+            text = prev.text.decode()
+            # JSDoc: /** ... */
+            if text.startswith("/**"):
+                # Extract first line of content
+                lines = text.strip("/* \n").split("\n")
+                for line in lines:
+                    line = line.strip().lstrip("* ").strip()
+                    if line:
+                        return line
+        return None
+
+
+# --- Concrete extractors ---
+
+
+class JavaScriptExtractor(_JSExtractorBase):
+    extensions = [".js", ".jsx", ".mjs", ".cjs"]
+
+    def __init__(self) -> None:
+        import tree_sitter_javascript as tsjs
+
+        self._parser = Parser(Language(tsjs.language()))
+
+    def extract(self, source: bytes, file_path: str, module_name: str) -> ExtractResult:
+        return self._extract(self._parser, source, file_path, module_name)
+
+
+class TypeScriptExtractor(_JSExtractorBase):
+    extensions = [".ts"]
+
+    def __init__(self) -> None:
+        import tree_sitter_typescript as tsts
+
+        self._parser = Parser(Language(tsts.language_typescript()))
+
+    def extract(self, source: bytes, file_path: str, module_name: str) -> ExtractResult:
+        return self._extract(self._parser, source, file_path, module_name)
+
+
+class TSXExtractor(_JSExtractorBase):
+    extensions = [".tsx"]
+
+    def __init__(self) -> None:
+        import tree_sitter_typescript as tsts
+
+        self._parser = Parser(Language(tsts.language_tsx()))
+
+    def extract(self, source: bytes, file_path: str, module_name: str) -> ExtractResult:
+        return self._extract(self._parser, source, file_path, module_name)
+
+
+def _find_child(node: TSNode, type_name: str) -> TSNode | None:
+    for child in node.children:
+        if child.type == type_name:
+            return child
+    return None
+
+
+# Register all extractors — each catches its own ImportError
+try:
+    register(JavaScriptExtractor())
+except ImportError:
+    pass
+
+try:
+    register(TypeScriptExtractor())
+    register(TSXExtractor())
+except ImportError:
+    pass
