@@ -9,6 +9,20 @@ from semg.model import Edge, Node, NodeType, RelType
 _LANGUAGE = Language(tspython.language())
 _PARSER = Parser(_LANGUAGE)
 
+# Common builtins to skip (these never resolve to graph nodes)
+_BUILTINS = frozenset({
+    "print", "len", "range", "enumerate", "zip", "map", "filter",
+    "isinstance", "issubclass", "hasattr", "getattr", "setattr", "delattr",
+    "type", "id", "hash", "repr", "str", "int", "float", "bool", "bytes",
+    "list", "dict", "set", "tuple", "frozenset",
+    "sorted", "reversed", "min", "max", "sum", "abs", "round",
+    "open", "iter", "next", "any", "all",
+    "super", "property", "staticmethod", "classmethod",
+    "ValueError", "TypeError", "KeyError", "AttributeError", "RuntimeError",
+    "Exception", "NotImplementedError", "StopIteration", "AssertionError",
+    "OSError", "IOError", "FileNotFoundError", "ImportError",
+})
+
 
 class PythonExtractor:
     extensions = [".py"]
@@ -149,6 +163,79 @@ class PythonExtractor:
                         rel=RelType.DECORATES,
                         metadata={"unresolved": True},
                     ))
+
+        # Extract calls from function body
+        body = node.child_by_field_name("body")
+        if body is not None:
+            class_name = parent_name if is_method else None
+            self._extract_calls(body, qualified, class_name, out_edges)
+
+    def _extract_calls(
+        self,
+        node: TSNode,
+        caller_name: str,
+        class_name: str | None,
+        out_edges: list[Edge],
+    ) -> None:
+        """Recursively walk AST and extract call edges."""
+        if node.type == "call":
+            func_node = node.child_by_field_name("function")
+            if func_node is not None:
+                result = self._call_target(func_node, class_name)
+                if result is not None:
+                    target, resolved = result
+                    metadata = {} if resolved else {"unresolved": True}
+                    out_edges.append(Edge(
+                        source=caller_name,
+                        target=target,
+                        rel=RelType.CALLS,
+                        metadata=metadata,
+                    ))
+        # Recurse into children (but not into nested function/class definitions)
+        for child in node.children:
+            if child.type in ("function_definition", "class_definition", "decorated_definition"):
+                continue
+            self._extract_calls(child, caller_name, class_name, out_edges)
+
+    def _call_target(self, func_node: TSNode, class_name: str | None) -> tuple[str, bool] | None:
+        """Resolve a call's function node to (target_name, is_resolved).
+
+        Returns None to skip the call (dynamic/unparseable).
+        """
+        if func_node.type == "identifier":
+            name = func_node.text.decode()
+            # Skip common builtins
+            if name in _BUILTINS:
+                return None
+            return (name, False)  # unresolved — needs suffix matching
+
+        if func_node.type == "attribute":
+            obj = func_node.child_by_field_name("object")
+            attr = func_node.child_by_field_name("attribute")
+            if obj is None or attr is None:
+                return None
+            attr_name = attr.text.decode()
+
+            # self.method() or cls.method() — resolve to ClassName.method
+            if obj.type == "identifier" and obj.text in (b"self", b"cls") and class_name:
+                return (f"{class_name}.{attr_name}", True)  # resolved
+
+            # super().method() — skip for now
+            if obj.type == "call":
+                inner = obj.child_by_field_name("function")
+                if inner and inner.type == "identifier" and inner.text == b"super":
+                    return None
+
+            # obj.method() — try as dotted name, unresolved
+            if obj.type == "identifier":
+                obj_name = obj.text.decode()
+                return (f"{obj_name}.{attr_name}", False)
+
+            # module.sub.func() — full dotted name
+            if obj.type == "attribute":
+                return (f"{obj.text.decode()}.{attr_name}", False)
+
+        return None
 
     def _extract_assignment(
         self,

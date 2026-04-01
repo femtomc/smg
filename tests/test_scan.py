@@ -339,3 +339,153 @@ def test_scan_cli(tmp_path):
     names = [n["name"] for n in nodes]
     assert "mylib.core.Base" in names
     assert "mylib.core.Engine" in names
+
+
+# --- Call graph extraction tests ---
+
+
+@needs_tree_sitter
+def test_scan_calls_simple(tmp_path):
+    """A function calling another function in the same module."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "core.py").write_text('''\
+def helper():
+    pass
+
+def main():
+    helper()
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.core.main", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "app.core.helper" in targets
+
+
+@needs_tree_sitter
+def test_scan_calls_self_method(tmp_path):
+    """self.method() resolves to ClassName.method."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "engine.py").write_text('''\
+class Engine:
+    def start(self):
+        pass
+
+    def run(self):
+        self.start()
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.engine.Engine.run", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "app.engine.Engine.start" in targets
+
+
+@needs_tree_sitter
+def test_scan_calls_between_modules(tmp_path):
+    """Cross-module call resolved via name matching."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "utils.py").write_text('''\
+def format_name(name):
+    return name.strip()
+''')
+    (pkg / "core.py").write_text('''\
+def process():
+    format_name("hello")
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.core.process", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "app.utils.format_name" in targets
+
+
+@needs_tree_sitter
+def test_scan_calls_builtins_skipped(tmp_path):
+    """Calls to builtins (print, len, etc.) are not added as edges."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "core.py").write_text('''\
+def main():
+    print("hello")
+    x = len([1, 2, 3])
+    y = range(10)
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.core.main", rel=RelType.CALLS)
+    assert len(edges) == 0
+
+
+@needs_tree_sitter
+def test_scan_calls_deduplication(tmp_path):
+    """Calling the same function twice produces only one edge."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "core.py").write_text('''\
+def helper():
+    pass
+
+def main():
+    helper()
+    helper()
+    helper()
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.core.main", rel=RelType.CALLS)
+    call_targets = [e.target for e in edges if e.rel.value == "calls"]
+    assert call_targets.count("app.core.helper") == 1
+
+
+@needs_tree_sitter
+def test_scan_calls_nested(tmp_path):
+    """Calls inside if/for/with blocks are still extracted."""
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "core.py").write_text('''\
+def a():
+    pass
+
+def b():
+    pass
+
+def main():
+    if True:
+        a()
+    for x in []:
+        b()
+''')
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.core.main", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "app.core.a" in targets
+    assert "app.core.b" in targets
