@@ -1375,22 +1375,38 @@ def watch(paths: tuple[str, ...], debounce: float) -> None:
 
     watch_dirs = [Path(p).resolve() for p in paths] if paths else [Path.cwd().resolve()]
 
-    def on_scan(stats, files):
+    def on_scan(diff, stats, files):
         names = [str(f.relative_to(root)) for f in files]
         file_list = ", ".join(names[:3])
         if len(names) > 3:
             file_list += f" (+{len(names) - 3} more)"
 
-        parts = []
-        if stats.nodes_added:
-            parts.append(f"+{stats.nodes_added} nodes")
-        if stats.nodes_removed:
-            parts.append(f"-{stats.nodes_removed} nodes")
-        if stats.edges_added:
-            parts.append(f"+{stats.edges_added} edges")
+        if diff.is_empty:
+            console.print(f"[dim]{file_list}[/] → [dim]no structural changes[/]")
+            return
 
-        summary = ", ".join(parts) if parts else "no changes"
-        console.print(f"[dim]{file_list}[/] → {summary}")
+        parts = []
+        if diff.added_nodes:
+            parts.append(f"[green]+{len(diff.added_nodes)} nodes[/]")
+        if diff.removed_nodes:
+            parts.append(f"[red]-{len(diff.removed_nodes)} nodes[/]")
+        if diff.changed_nodes:
+            parts.append(f"[yellow]~{len(diff.changed_nodes)} changed[/]")
+        if diff.added_edges:
+            parts.append(f"[green]+{len(diff.added_edges)} edges[/]")
+        if diff.removed_edges:
+            parts.append(f"[red]-{len(diff.removed_edges)} edges[/]")
+
+        console.print(f"[dim]{file_list}[/] → {', '.join(parts)}")
+
+        # Show specific additions/removals for small diffs
+        for node in diff.added_nodes[:3]:
+            console.print(f"  [green]+[/] [{_type_badge(node.type.value)}] {node.name}")
+        for node in diff.removed_nodes[:3]:
+            console.print(f"  [red]-[/] [{_type_badge(node.type.value)}] {node.name}")
+        for node, changes in diff.changed_nodes[:3]:
+            for c in changes:
+                console.print(f"  [yellow]~[/] {node.name} {c.field}: {c.old} → {c.new}")
 
         if stats.orphaned_manual_edges:
             for oe in stats.orphaned_manual_edges:

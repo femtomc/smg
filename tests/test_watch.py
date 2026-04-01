@@ -41,8 +41,8 @@ def test_watch_detects_change(tmp_path):
     # Track scan events
     events = []
 
-    def on_scan(stats, files):
-        events.append({"stats": stats, "files": files})
+    def on_scan(diff, stats, files):
+        events.append({"diff": diff, "stats": stats, "files": files})
 
     # Start watcher in a thread
     watcher_thread = threading.Thread(

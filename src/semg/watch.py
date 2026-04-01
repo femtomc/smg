@@ -1,15 +1,16 @@
 """File watcher that auto-rescans changed files."""
 from __future__ import annotations
 
+import fnmatch
 import threading
-import time
 from pathlib import Path
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from semg.langs import load_extractors, get_extractor
-from semg.scan import scan_paths, _strip_extension, DEFAULT_EXCLUDES
+from semg.diff import diff_graphs
+from semg.langs import get_extractor, load_extractors
+from semg.scan import DEFAULT_EXCLUDES, _strip_extension, scan_paths
 from semg.storage import load_graph, save_graph
 
 
@@ -29,9 +30,10 @@ class _ScanHandler(FileSystemEventHandler):
 
     def _is_supported(self, path: str) -> bool:
         p = Path(path)
-        # Skip excluded directories
         for part in p.parts:
-            if part in DEFAULT_EXCLUDES or part.startswith("."):
+            if any(fnmatch.fnmatch(part, pat) for pat in DEFAULT_EXCLUDES):
+                return False
+            if part.startswith("."):
                 return False
         return _strip_extension(p.name) is not None
 
@@ -48,7 +50,6 @@ class _ScanHandler(FileSystemEventHandler):
             self._schedule(Path(event.src_path))
 
     def on_deleted(self, event: FileSystemEvent) -> None:
-        # For deletions, we'd need to remove nodes — handle via clean on next scan
         pass
 
     def _schedule(self, path: Path) -> None:
@@ -77,18 +78,21 @@ def watch_and_scan(
 ) -> None:
     """Watch paths for changes and rescan modified files.
 
-    Blocks until interrupted (Ctrl+C). Calls on_scan(stats) after each rescan cycle.
+    Blocks until interrupted (Ctrl+C). Calls on_scan(diff, files) after each
+    rescan cycle, where diff is a GraphDiff showing the net structural change.
     """
     load_extractors()
 
     handler = _ScanHandler(root, debounce=debounce)
 
     def do_rescan(files: list[Path]) -> None:
+        old_graph = load_graph(root)
         graph = load_graph(root)
         stats = scan_paths(graph, root, files, clean=True)
         save_graph(graph, root)
+        result = diff_graphs(old_graph, graph)
         if on_scan:
-            on_scan(stats, files)
+            on_scan(result, stats, files)
 
     handler.on_callback(do_rescan)
 
