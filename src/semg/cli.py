@@ -32,7 +32,7 @@ click.rich_click.STYLE_SWITCH = "bold green"
 click.rich_click.STYLE_METAVAR = "dim"
 click.rich_click.COMMAND_GROUPS = {
     "semg": [
-        {"name": "Explore", "commands": ["about", "impact", "between", "overview", "diff"]},
+        {"name": "Explore", "commands": ["about", "impact", "between", "overview", "diff", "analyze"]},
         {"name": "Inspect", "commands": ["show", "list", "status", "query", "validate"]},
         {"name": "Mutate", "commands": ["init", "add", "link", "rm", "unlink", "update", "scan", "watch", "batch"]},
         {"name": "Export", "commands": ["export"]},
@@ -871,6 +871,178 @@ def diff(ref: str, fmt: str | None) -> None:
     if result.changed_nodes:
         parts.append(f"[yellow]~{len(result.changed_nodes)}[/]")
     console.print(f"\n[dim]Nodes: {', '.join(parts)} | Edges: +{len(result.added_edges)} -{len(result.removed_edges)}[/]")
+
+
+# --- Analyze ---
+
+
+@main.command()
+@click.option("--top", "top_n", default=10, type=int, help="Number of top entries to show per ranking")
+@click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
+def analyze(top_n: int, fmt: str | None) -> None:
+    """Deep architectural analysis — graph metrics, OO metrics, and structural health.
+
+    Runs cycle detection, PageRank, betweenness centrality, k-core decomposition,
+    CK class metrics (WMC, CBO, RFC, LCOM4, DIT, NOC), Martin's package metrics
+    (Instability, Abstractness, Distance), and SDP violation detection.
+    """
+    import json as json_mod
+
+    from semg import graph_metrics, oo_metrics
+
+    graph, _root = _load()
+    fmt = _auto_fmt(fmt)
+
+    # Graph-theoretic
+    cycles = graph_metrics.find_cycles(graph)
+    layers = graph_metrics.topological_layers(graph)
+    pr = graph_metrics.pagerank(graph)
+    bc = graph_metrics.betweenness_centrality(graph)
+    kc = graph_metrics.kcore_decomposition(graph)
+    bridges = graph_metrics.detect_bridges(graph)
+
+    # OO metrics
+    wmc_data = oo_metrics.wmc(graph)
+    dit_data = oo_metrics.dit(graph)
+    noc_data = oo_metrics.noc(graph)
+    cbo_data = oo_metrics.cbo(graph)
+    rfc_data = oo_metrics.rfc(graph)
+    lcom_data = oo_metrics.lcom4(graph)
+    martin_data = oo_metrics.martin_metrics(graph)
+    sdp = oo_metrics.sdp_violations(graph)
+
+    # Summaries
+    max_layer = max(layers.values()) if layers else 0
+    core_nodes = [n for n, k in kc.items() if k == max(kc.values())] if kc else []
+    pr_top = sorted(pr.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    bc_top = sorted(bc.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+    if fmt == "json":
+        data = {
+            "graph": {
+                "cycles": cycles,
+                "cycle_count": len(cycles),
+                "max_layer": max_layer,
+                "bridge_count": len(bridges),
+                "bridges": [list(b) for b in bridges[:top_n]],
+            },
+            "pagerank": [{"name": n, "rank": round(r, 6)} for n, r in pr_top],
+            "betweenness": [{"name": n, "centrality": round(c, 6)} for n, c in bc_top],
+            "kcore": {"max_coreness": max(kc.values()) if kc else 0, "core_size": len(core_nodes)},
+            "classes": {
+                name: {
+                    "wmc": wmc_data.get(name, 0),
+                    "dit": dit_data.get(name, 0),
+                    "noc": noc_data.get(name, 0),
+                    "cbo": cbo_data.get(name, 0),
+                    "rfc": rfc_data.get(name, 0),
+                    "lcom4": lcom_data.get(name, 0),
+                }
+                for name in sorted(wmc_data.keys())
+            },
+            "modules": martin_data,
+            "sdp_violations": sdp,
+        }
+        click.echo(json_mod.dumps(data, indent=2))
+        return
+
+    # --- Rich text output ---
+
+    # Cycles
+    if cycles:
+        console.print(f"\n[red bold]Circular Dependencies[/] ({len(cycles)} cycle(s))")
+        for cycle in cycles[:5]:
+            console.print(f"  [red]-[/] {' -> '.join(cycle)}")
+        if len(cycles) > 5:
+            console.print(f"  [dim]... and {len(cycles) - 5} more[/]")
+    else:
+        console.print("\n[green]No circular dependencies[/]")
+
+    # Architecture layers
+    console.print(f"\n[bold]Architecture Depth:[/] {max_layer + 1} layers")
+
+    # PageRank
+    console.print(f"\n[bold]Most Important (PageRank)[/]")
+    pr_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+    pr_table.add_column("#", style="dim", width=3)
+    pr_table.add_column("Name", style="bold")
+    pr_table.add_column("Rank", justify="right")
+    for i, (name, rank) in enumerate(pr_top, 1):
+        pr_table.add_row(str(i), name, f"{rank:.4f}")
+    console.print(pr_table)
+
+    # Betweenness (bottlenecks)
+    bc_nonzero = [(n, c) for n, c in bc_top if c > 0]
+    if bc_nonzero:
+        console.print(f"\n[bold]Structural Bottlenecks (Betweenness)[/]")
+        bc_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        bc_table.add_column("#", style="dim", width=3)
+        bc_table.add_column("Name", style="bold")
+        bc_table.add_column("Centrality", justify="right")
+        for i, (name, cent) in enumerate(bc_nonzero[:top_n], 1):
+            bc_table.add_row(str(i), name, f"{cent:.4f}")
+        console.print(bc_table)
+
+    # Bridges
+    if bridges:
+        console.print(f"\n[yellow]Fragile Connections:[/] {len(bridges)} bridge edge(s)")
+        for a, b in bridges[:5]:
+            console.print(f"  [yellow]-[/] {a} -- {b}")
+
+    # Class metrics
+    if wmc_data:
+        console.print(f"\n[bold]Class Metrics (CK Suite)[/]")
+        ck_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        ck_table.add_column("Class", style="bold")
+        ck_table.add_column("WMC", justify="right")
+        ck_table.add_column("CBO", justify="right")
+        ck_table.add_column("RFC", justify="right")
+        ck_table.add_column("LCOM4", justify="right")
+        ck_table.add_column("DIT", justify="right")
+        ck_table.add_column("NOC", justify="right")
+        for name in sorted(wmc_data.keys(), key=lambda n: wmc_data[n], reverse=True)[:top_n]:
+            lcom_val = lcom_data.get(name, 0)
+            lcom_str = f"[red]{lcom_val}[/]" if lcom_val > 1 else str(lcom_val)
+            ck_table.add_row(
+                name,
+                str(wmc_data.get(name, 0)),
+                str(cbo_data.get(name, 0)),
+                str(rfc_data.get(name, 0)),
+                lcom_str,
+                str(dit_data.get(name, 0)),
+                str(noc_data.get(name, 0)),
+            )
+        console.print(ck_table)
+
+    # Module metrics (Martin)
+    if martin_data:
+        console.print(f"\n[bold]Module Metrics (Martin)[/]")
+        mod_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        mod_table.add_column("Module", style="bold")
+        mod_table.add_column("Ca", justify="right")
+        mod_table.add_column("Ce", justify="right")
+        mod_table.add_column("I", justify="right")
+        mod_table.add_column("A", justify="right")
+        mod_table.add_column("D", justify="right")
+        for name in sorted(martin_data.keys()):
+            m = martin_data[name]
+            d_str = f"[red]{m['distance']}[/]" if m["distance"] > 0.7 else str(m["distance"])
+            mod_table.add_row(
+                name, str(m["ca"]), str(m["ce"]),
+                str(m["instability"]), str(m["abstractness"]), d_str,
+            )
+        console.print(mod_table)
+
+    # SDP violations
+    if sdp:
+        console.print(f"\n[red bold]SDP Violations[/] ({len(sdp)})")
+        for v in sdp[:5]:
+            console.print(
+                f"  [red]-[/] {v['source']} [dim](I={v['source_instability']})[/]"
+                f" depends on {v['target']} [dim](I={v['target_instability']})[/]"
+            )
+    else:
+        console.print(f"\n[green]No SDP violations[/]")
 
 
 # --- Scan ---
