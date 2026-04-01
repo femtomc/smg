@@ -21,6 +21,7 @@ scan = [
     "tree-sitter-python>=0.23",
     "tree-sitter-typescript>=0.23.2",
     "tree-sitter-zig>=1.1.2",
+    "watchdog>=6.0.0",
 ]
 dev = [
     "pytest>=8.0",

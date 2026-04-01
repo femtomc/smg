@@ -34,7 +34,7 @@ click.rich_click.COMMAND_GROUPS = {
     "semg": [
         {"name": "Explore", "commands": ["about", "impact", "between", "overview", "diff"]},
         {"name": "Inspect", "commands": ["show", "list", "status", "query", "validate"]},
-        {"name": "Mutate", "commands": ["init", "add", "link", "rm", "unlink", "update", "scan", "batch"]},
+        {"name": "Mutate", "commands": ["init", "add", "link", "rm", "unlink", "update", "scan", "watch", "batch"]},
         {"name": "Export", "commands": ["export"]},
     ],
 }
@@ -954,6 +954,59 @@ def scan(paths: tuple[str, ...], clean: bool, changed: bool, since: str | None, 
             console.print(f"\n[yellow]Warning:[/] {len(stats.orphaned_manual_edges)} manual edge(s) orphaned:")
             for oe in stats.orphaned_manual_edges:
                 console.print(f"  {oe['source']} [dim]--{oe['rel']}-->[/] {oe['target']} [dim]({oe['reason']})[/]")
+
+
+# --- Watch ---
+
+
+@main.command()
+@click.argument("paths", nargs=-1, type=click.Path(exists=True))
+@click.option("--debounce", default=0.5, type=float, help="Seconds to wait before rescanning after a change")
+def watch(paths: tuple[str, ...], debounce: float) -> None:
+    """Watch source files and auto-rescan on changes.
+
+    Monitors the filesystem for changes to supported source files and
+    triggers an incremental rescan (with --clean) automatically. Runs
+    until interrupted with Ctrl+C.
+    """
+    try:
+        from semg.watch import watch_and_scan
+    except ImportError:
+        err_console.print(
+            "[red]Error:[/] watchdog not installed. Install with: [bold]uv pip install semg\\[scan][/]"
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    _graph, root = _load()
+
+    watch_dirs = [Path(p).resolve() for p in paths] if paths else [Path.cwd().resolve()]
+
+    def on_scan(stats, files):
+        names = [str(f.relative_to(root)) for f in files]
+        file_list = ", ".join(names[:3])
+        if len(names) > 3:
+            file_list += f" (+{len(names) - 3} more)"
+
+        parts = []
+        if stats.nodes_added:
+            parts.append(f"+{stats.nodes_added} nodes")
+        if stats.nodes_removed:
+            parts.append(f"-{stats.nodes_removed} nodes")
+        if stats.edges_added:
+            parts.append(f"+{stats.edges_added} edges")
+
+        summary = ", ".join(parts) if parts else "no changes"
+        console.print(f"[dim]{file_list}[/] → {summary}")
+
+        if stats.orphaned_manual_edges:
+            for oe in stats.orphaned_manual_edges:
+                console.print(f"  [yellow]orphaned:[/] {oe['source']} --{oe['rel']}--> {oe['target']}")
+
+    console.print(f"[bold]Watching[/] {', '.join(str(p) for p in watch_dirs)}")
+    console.print("[dim]Press Ctrl+C to stop.[/]\n")
+
+    watch_and_scan(root, watch_dirs, on_scan=on_scan, debounce=debounce)
+    console.print("\n[dim]Stopped.[/]")
 
 
 # --- Batch ---
