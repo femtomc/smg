@@ -122,6 +122,84 @@ def format_node(node: Node, incoming: list[Edge], outgoing: list[Edge], fmt: str
     return "\n".join(lines)
 
 
+def to_dsm(graph: SemGraph, level: str = "module") -> str:
+    """Dependency Structure Matrix as CSV.
+
+    Rows and columns are nodes at the given granularity (default: module).
+    Cell (i,j) = number of coupling edges from node i to node j.
+    Non-zero cells indicate dependencies; the diagonal is always 0.
+    """
+    from collections import defaultdict
+    from smg.model import NodeType, RelType
+
+    coupling_rels = frozenset({
+        RelType.CALLS.value, RelType.IMPORTS.value, RelType.INHERITS.value,
+        RelType.IMPLEMENTS.value, RelType.DEPENDS_ON.value,
+    })
+
+    # Select nodes at the requested granularity
+    if level == "module":
+        target_types = {NodeType.MODULE.value, NodeType.PACKAGE.value}
+    elif level == "class":
+        target_types = {NodeType.MODULE.value, NodeType.PACKAGE.value, NodeType.CLASS.value}
+    else:  # "all"
+        target_types = None
+
+    if target_types is not None:
+        names = sorted(n.name for n in graph.all_nodes() if n.type.value in target_types)
+    else:
+        names = sorted(n.name for n in graph.all_nodes())
+
+    if not names:
+        return ""
+
+    name_set = frozenset(names)
+
+    # For module/class level, map each node to its nearest ancestor in the DSM
+    node_to_dsm: dict[str, str] = {}
+    if target_types is not None:
+        for node in graph.all_nodes():
+            if node.name in name_set:
+                node_to_dsm[node.name] = node.name
+            else:
+                # Walk up containment to find the DSM-level ancestor
+                current = node.name
+                while True:
+                    parents = [e.source for e in graph.incoming(current, rel=RelType.CONTAINS)]
+                    if not parents:
+                        break
+                    parent = parents[0]
+                    if parent in name_set:
+                        node_to_dsm[node.name] = parent
+                        break
+                    current = parent
+    else:
+        for name in names:
+            node_to_dsm[name] = name
+
+    # Build the matrix
+    matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for edge in graph.all_edges():
+        if edge.rel.value not in coupling_rels:
+            continue
+        src_dsm = node_to_dsm.get(edge.source)
+        tgt_dsm = node_to_dsm.get(edge.target)
+        if src_dsm and tgt_dsm and src_dsm != tgt_dsm:
+            matrix[src_dsm][tgt_dsm] += 1
+
+    # Render as CSV
+    lines: list[str] = []
+    header = [""] + names
+    lines.append(",".join(header))
+    for row in names:
+        cells = [row]
+        for col in names:
+            cells.append(str(matrix[row][col]))
+        lines.append(",".join(cells))
+
+    return "\n".join(lines)
+
+
 def _mermaid_id(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "_", name)
 

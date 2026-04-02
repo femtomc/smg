@@ -501,3 +501,105 @@ def layering_violations(graph: SemGraph) -> list[dict]:
             })
 
     return sorted(violations, key=lambda v: (v["target_layer"] - v["source_layer"], v["source"]))
+
+
+# --- HITS (Hub/Authority) ---
+
+
+def hits(
+    graph: SemGraph,
+    iterations: int = 50,
+) -> dict[str, dict[str, float]]:
+    """Compute HITS hub and authority scores on coupling edges.
+
+    Authorities are nodes pointed to by many hubs (core utilities).
+    Hubs are nodes that point to many authorities (orchestrators).
+    Returns dict keyed by node name with {"hub": float, "authority": float}.
+    """
+    fwd, rev, nodes = _coupling_adj(graph)
+    if not nodes:
+        return {}
+
+    node_list = sorted(nodes)
+    hub = {n: 1.0 for n in node_list}
+    auth = {n: 1.0 for n in node_list}
+
+    for _ in range(iterations):
+        # Authority update: auth(v) = sum of hub(u) for all u -> v
+        new_auth: dict[str, float] = {}
+        for n in node_list:
+            new_auth[n] = sum(hub[src] for src in rev.get(n, set()))
+
+        # Hub update: hub(v) = sum of auth(u) for all v -> u
+        new_hub: dict[str, float] = {}
+        for n in node_list:
+            new_hub[n] = sum(new_auth[tgt] for tgt in fwd.get(n, set()))
+
+        # Normalize
+        auth_norm = max(sum(v * v for v in new_auth.values()) ** 0.5, 1e-10)
+        hub_norm = max(sum(v * v for v in new_hub.values()) ** 0.5, 1e-10)
+        auth = {n: v / auth_norm for n, v in new_auth.items()}
+        hub = {n: v / hub_norm for n, v in new_hub.items()}
+
+    return {n: {"hub": round(hub[n], 6), "authority": round(auth[n], 6)} for n in node_list}
+
+
+# --- Minimal cycle extraction ---
+
+
+def minimal_cycle(graph: SemGraph, scc: list[str]) -> list[str]:
+    """Extract the shortest cycle from a strongly connected component.
+
+    Returns a list of node names forming the shortest directed cycle
+    within the SCC, using only coupling edges. The cycle starts from
+    the lexicographically smallest node for determinism.
+    """
+    if len(scc) <= 1:
+        return scc
+
+    scc_set = frozenset(scc)
+    fwd, _, _ = _coupling_adj(graph)
+
+    # Restrict adjacency to nodes in the SCC
+    local_fwd: dict[str, set[str]] = {}
+    for n in scc:
+        local_fwd[n] = fwd.get(n, set()) & scc_set
+
+    # BFS from each node to find shortest cycle through it
+    best: list[str] | None = None
+    for start in sorted(scc):
+        # BFS: find shortest path from start back to start
+        visited: dict[str, str | None] = {start: None}
+        queue: deque[str] = deque()
+        # Seed with start's neighbors (not start itself)
+        for neighbor in sorted(local_fwd.get(start, set())):
+            if neighbor == start:
+                # Self-loop shouldn't happen in SCC with >1 node, but handle it
+                return [start]
+            if neighbor not in visited:
+                visited[neighbor] = start
+                queue.append(neighbor)
+
+        found = False
+        while queue and not found:
+            current = queue.popleft()
+            for neighbor in sorted(local_fwd.get(current, set())):
+                if neighbor == start:
+                    # Found a cycle back to start -- reconstruct path
+                    path = [start]
+                    n = current
+                    while n != start:
+                        path.append(n)
+                        n = visited[n]
+                    path.reverse()
+                    # path is now [start, ..., current] and current -> start closes it
+                    cycle = path
+                    if best is None or len(cycle) < len(best):
+                        best = cycle
+                    found = True
+                    break
+                if neighbor not in visited:
+                    visited[neighbor] = current
+                    queue.append(neighbor)
+
+    return best if best is not None else sorted(scc)

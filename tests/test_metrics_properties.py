@@ -16,8 +16,10 @@ from smg.graph_metrics import (
     detect_bridges,
     fan_in_out,
     find_cycles,
+    hits,
     kcore_decomposition,
     layering_violations,
+    minimal_cycle,
     pagerank,
     topological_layers,
 )
@@ -538,6 +540,126 @@ class TestSDPViolationProperties:
 # ============================================================
 
 
+class TestHITSProperties:
+
+    @given(random_graph(min_nodes=3))
+    @settings(max_examples=100)
+    def test_hits_scores_non_negative(self, g: SemGraph):
+        h = hits(g)
+        for v in h.values():
+            assert v["hub"] >= 0
+            assert v["authority"] >= 0
+
+    @given(random_graph(min_nodes=3))
+    @settings(max_examples=100)
+    def test_hits_covers_coupling_nodes(self, g: SemGraph):
+        """Every node in a coupling edge appears in the result."""
+        h = hits(g)
+        coupling_rels = {"calls", "imports", "inherits", "implements", "depends_on"}
+        for edge in g.all_edges():
+            if edge.rel.value in coupling_rels:
+                assert edge.source in h
+                assert edge.target in h
+
+    @given(random_graph(min_nodes=3))
+    @settings(max_examples=100)
+    def test_hits_hub_norm_approximately_one(self, g: SemGraph):
+        """Hub scores should be L2-normalized to ~1."""
+        h = hits(g)
+        if h:
+            hub_norm = sum(v["hub"] ** 2 for v in h.values()) ** 0.5
+            assert abs(hub_norm - 1.0) < 0.05 or hub_norm < 0.01
+
+    @given(random_graph(min_nodes=3))
+    @settings(max_examples=100)
+    def test_hits_authority_norm_approximately_one(self, g: SemGraph):
+        """Authority scores should be L2-normalized to ~1."""
+        h = hits(g)
+        if h:
+            auth_norm = sum(v["authority"] ** 2 for v in h.values()) ** 0.5
+            assert abs(auth_norm - 1.0) < 0.05 or auth_norm < 0.01
+
+    def test_star_topology(self):
+        """In a star where hub calls 5 targets, hub has high hub score, targets have high authority."""
+        g = SemGraph()
+        g.add_node(Node(name="hub", type=NodeType.FUNCTION))
+        for i in range(5):
+            name = f"t{i}"
+            g.add_node(Node(name=name, type=NodeType.FUNCTION))
+            g.add_edge(Edge(source="hub", target=name, rel=RelType.CALLS))
+        h = hits(g)
+        # Hub should have the highest hub score
+        assert h["hub"]["hub"] == max(v["hub"] for v in h.values())
+        # Each target should have equal authority
+        auth_vals = {h[f"t{i}"]["authority"] for i in range(5)}
+        assert len(auth_vals) == 1  # all equal
+
+
+class TestMinimalCycleProperties:
+
+    @given(random_graph())
+    @settings(max_examples=100)
+    def test_minimal_cycle_is_subset_of_scc(self, g: SemGraph):
+        """The minimal cycle must use only nodes from the SCC."""
+        cycles = find_cycles(g)
+        for scc in cycles:
+            mc = minimal_cycle(g, scc)
+            assert set(mc).issubset(set(scc))
+
+    @given(random_graph())
+    @settings(max_examples=100)
+    def test_minimal_cycle_length_bounded(self, g: SemGraph):
+        """The minimal cycle cannot be longer than the SCC."""
+        cycles = find_cycles(g)
+        for scc in cycles:
+            mc = minimal_cycle(g, scc)
+            assert len(mc) <= len(scc)
+            assert len(mc) >= 2  # SCC has at least 2 nodes
+
+    @given(random_graph())
+    @settings(max_examples=100)
+    def test_minimal_cycle_forms_actual_cycle(self, g: SemGraph):
+        """The minimal cycle path must be a valid directed cycle via coupling edges."""
+        cycles = find_cycles(g)
+        coupling_rels = {"calls", "imports", "inherits", "implements", "depends_on"}
+        for scc in cycles:
+            mc = minimal_cycle(g, scc)
+            if len(mc) < 2:
+                continue
+            # Check each consecutive pair has a coupling edge
+            for i in range(len(mc)):
+                src = mc[i]
+                tgt = mc[(i + 1) % len(mc)]
+                has_edge = any(
+                    e.source == src and e.target == tgt and e.rel.value in coupling_rels
+                    for e in g.all_edges()
+                )
+                assert has_edge, f"no coupling edge {src} -> {tgt}"
+
+    def test_simple_triangle(self):
+        """A -> B -> C -> A: minimal cycle is [A, B, C]."""
+        g = SemGraph()
+        for n in ["a", "b", "c"]:
+            g.add_node(Node(name=n, type=NodeType.FUNCTION))
+        g.add_edge(Edge(source="a", target="b", rel=RelType.CALLS))
+        g.add_edge(Edge(source="b", target="c", rel=RelType.CALLS))
+        g.add_edge(Edge(source="c", target="a", rel=RelType.CALLS))
+        mc = minimal_cycle(g, ["a", "b", "c"])
+        assert len(mc) == 3
+
+    def test_picks_shorter_cycle(self):
+        """SCC with both a 2-cycle and a 3-cycle: picks the 2-cycle."""
+        g = SemGraph()
+        for n in ["a", "b", "c"]:
+            g.add_node(Node(name=n, type=NodeType.FUNCTION))
+        g.add_edge(Edge(source="a", target="b", rel=RelType.CALLS))
+        g.add_edge(Edge(source="b", target="a", rel=RelType.CALLS))  # 2-cycle
+        g.add_edge(Edge(source="b", target="c", rel=RelType.CALLS))
+        g.add_edge(Edge(source="c", target="a", rel=RelType.CALLS))  # 3-cycle via c
+        mc = minimal_cycle(g, ["a", "b", "c"])
+        assert len(mc) == 2
+
+
 class TestFanInOutProperties:
 
     @given(random_graph())
@@ -1045,13 +1167,16 @@ class TestInvariantRuleProperties:
     @given(random_graph())
     @settings(max_examples=100)
     def test_no_cycles_agrees_with_find_cycles(self, g: SemGraph):
-        """The no-cycles invariant should agree with find_cycles."""
+        """The no-cycles invariant should agree with find_cycles on presence."""
         rule = Rule(name="test", type="invariant", invariant="no-cycles")
         v = check_invariant(rule, g)
         cycles = find_cycles(g)
         if cycles:
             assert v is not None
-            assert v.cycles == cycles
+            assert len(v.cycles) == len(cycles)
+            # Each minimal cycle's nodes should be a subset of its SCC
+            for mc, scc in zip(v.cycles, cycles):
+                assert set(mc).issubset(set(scc))
         else:
             assert v is None
 

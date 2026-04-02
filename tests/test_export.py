@@ -75,3 +75,71 @@ def test_format_node_json():
     assert result["name"] == "app.main"
     assert "incoming" in result
     assert "outgoing" in result
+
+
+# --- DSM export ---
+
+
+def _dsm_graph() -> SemGraph:
+    """Two modules with cross-module coupling."""
+    g = SemGraph()
+    g.add_node(Node(name="mod_a", type=NodeType.MODULE))
+    g.add_node(Node(name="mod_b", type=NodeType.MODULE))
+    g.add_node(Node(name="mod_a.f1", type=NodeType.FUNCTION))
+    g.add_node(Node(name="mod_b.f2", type=NodeType.FUNCTION))
+    g.add_edge(Edge(source="mod_a", target="mod_a.f1", rel=RelType.CONTAINS))
+    g.add_edge(Edge(source="mod_b", target="mod_b.f2", rel=RelType.CONTAINS))
+    g.add_edge(Edge(source="mod_a.f1", target="mod_b.f2", rel=RelType.CALLS))
+    g.add_edge(Edge(source="mod_a", target="mod_b", rel=RelType.IMPORTS))
+    return g
+
+
+def test_dsm_csv_format():
+    g = _dsm_graph()
+    csv = export.to_dsm(g)
+    lines = csv.strip().split("\n")
+    # Header + 2 rows
+    assert len(lines) == 3
+    header = lines[0].split(",")
+    assert header[0] == ""
+    assert "mod_a" in header
+    assert "mod_b" in header
+
+
+def test_dsm_captures_cross_module_deps():
+    g = _dsm_graph()
+    csv = export.to_dsm(g)
+    lines = csv.strip().split("\n")
+    # Find mod_a row
+    for line in lines[1:]:
+        cells = line.split(",")
+        if cells[0] == "mod_a":
+            header = lines[0].split(",")
+            b_idx = header.index("mod_b")
+            assert int(cells[b_idx]) >= 1  # at least the imports edge
+
+
+def test_dsm_diagonal_zero():
+    g = _dsm_graph()
+    csv = export.to_dsm(g)
+    lines = csv.strip().split("\n")
+    header = lines[0].split(",")
+    for line in lines[1:]:
+        cells = line.split(",")
+        name = cells[0]
+        idx = header.index(name)
+        assert cells[idx] == "0"
+
+
+def test_dsm_empty():
+    g = SemGraph()
+    assert export.to_dsm(g) == ""
+
+
+def test_dsm_level_all():
+    g = _dsm_graph()
+    csv = export.to_dsm(g, level="all")
+    lines = csv.strip().split("\n")
+    header = lines[0].split(",")
+    # All 4 nodes should appear
+    assert len(header) == 5  # "" + 4 names

@@ -923,6 +923,29 @@ def export_text() -> None:
     click.echo(export.to_text(graph))
 
 
+@export_cmd.command("dsm")
+@click.option("--level", default="module", type=click.Choice(["module", "class", "all"]), help="Granularity: module (default), class, or all nodes")
+def export_dsm(level: str) -> None:
+    """Export Dependency Structure Matrix as CSV.
+
+    \b
+    Rows and columns are nodes at the chosen granularity.
+    Cell (i,j) = number of coupling edges from node i to node j.
+
+    \b
+    Examples:
+      smg export dsm                        # module-level DSM
+      smg export dsm --level class          # class-level DSM
+      smg export dsm > deps.csv             # save to file
+    """
+    graph, _root = _load()
+    result = export.to_dsm(graph, level=level)
+    if not result:
+        err_console.print("[yellow]Warning:[/] no nodes at the requested granularity.")
+        return
+    click.echo(result)
+
+
 # --- Validate ---
 
 
@@ -1134,6 +1157,8 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
     dead = graph_metrics.dead_code(graph)
     _step("Checking layering violations...")
     layer_violations = graph_metrics.layering_violations(graph)
+    _step("Computing HITS (hub/authority)...")
+    hits_data = graph_metrics.hits(graph)
     _step("Detecting code smells...")
     gods = oo_metrics.god_classes(graph)
     envy = oo_metrics.feature_envy(graph)
@@ -1231,6 +1256,12 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
         if not summary:
             fio_top = sorted(fio.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)[:top_n]
             data["fan_in_out"] = [{"name": n, **v} for n, v in fio_top]
+            hits_hubs = sorted(hits_data.items(), key=lambda x: x[1]["hub"], reverse=True)[:top_n]
+            hits_auths = sorted(hits_data.items(), key=lambda x: x[1]["authority"], reverse=True)[:top_n]
+            data["hits"] = {
+                "top_hubs": [{"name": n, **v} for n, v in hits_hubs],
+                "top_authorities": [{"name": n, **v} for n, v in hits_auths],
+            }
         click.echo(json_mod.dumps(data, indent=2))
         return
 
@@ -1408,6 +1439,26 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
             fio_table.add_row(name, str(vals["fan_in"]), str(vals["fan_out"]), str(total))
         console.print(fio_table)
 
+    # HITS (Hub/Authority)
+    if hits_data:
+        console.print(f"\n[bold]Hubs & Authorities (HITS, top {top_n})[/]")
+        hits_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        hits_table.add_column("Name", style="bold")
+        hits_table.add_column("Hub", justify="right")
+        hits_table.add_column("Authority", justify="right")
+        hits_table.add_column("Role", justify="left")
+        hits_combined = sorted(
+            hits_data.items(),
+            key=lambda x: max(x[1]["hub"], x[1]["authority"]),
+            reverse=True,
+        )
+        for name, scores in hits_combined[:top_n]:
+            role = "hub" if scores["hub"] > scores["authority"] else "authority"
+            if scores["hub"] > 0.01 and scores["authority"] > 0.01:
+                role = "both"
+            hits_table.add_row(name, f"{scores['hub']:.4f}", f"{scores['authority']:.4f}", role)
+        console.print(hits_table)
+
 
 # --- Rules & Check ---
 
@@ -1583,7 +1634,8 @@ def check(name: str | None, fmt: str | None) -> None:
                         console.print(f"        [dim]... and {len(v.nodes) - 10} more[/]")
                 if v.cycles:
                     for cycle in v.cycles[:5]:
-                        console.print(f"        {' -> '.join(cycle)}")
+                        path = " -> ".join(cycle) + f" -> {cycle[0]}"
+                        console.print(f"        {path}")
                     if len(v.cycles) > 5:
                         console.print(f"        [dim]... and {len(v.cycles) - 5} more[/]")
 

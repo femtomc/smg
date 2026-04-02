@@ -139,11 +139,13 @@ def check_invariant(rule: Rule, graph: SemGraph) -> Violation | None:
     if inv == "no-cycles":
         cycles = graph_metrics.find_cycles(graph)
         if cycles:
+            # Extract minimal cycle paths for actionable output
+            minimal_cycles = [graph_metrics.minimal_cycle(graph, scc) for scc in cycles]
             return Violation(
                 rule_name=rule.name,
                 rule_type="invariant",
                 message=f"{len(cycles)} cycle(s)",
-                cycles=cycles,
+                cycles=minimal_cycles,
             )
     elif inv == "no-dead-code":
         entry_points: set[str] = set()
