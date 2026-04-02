@@ -33,6 +33,8 @@ smg impact MyClass          # What breaks if I change it?
 smg between api.routes db   # How do these relate?
 smg overview                # Orient me
 smg analyze                 # Architectural analysis
+smg rule add acyclic --invariant no-cycles
+smg check                   # Enforce architectural rules
 smg diff                    # What changed since last commit?
 ```
 
@@ -106,7 +108,17 @@ smg analyze --summary --top 5   # Key findings only
 smg query deps auth.service     # What does this depend on? (forward transitive)
 ```
 
-### 3. Inspect
+### 3. Enforce
+
+```bash
+smg rule add layering --deny "infra.* -> app.*"
+smg rule add acyclic --invariant no-cycles
+smg rule add reachable --invariant no-dead-code --entry-points "main,cli.*"
+smg check                       # check all rules (exit 1 on violation)
+smg check layering              # check a specific rule
+```
+
+### 4. Inspect
 
 ```bash
 smg show auth.service           # Node details + direct edges + metrics
@@ -115,7 +127,7 @@ smg query incoming auth.service --rel calls  # What calls it?
 smg list --type class           # All classes in the graph
 ```
 
-### 4. Mutate
+### 5. Mutate
 
 ```bash
 smg add endpoint /api/login --doc "Login endpoint" --meta method=POST
@@ -126,7 +138,7 @@ smg scan --since HEAD~3         # Incremental: since a specific ref
 smg watch src/                  # Auto-rescan on file changes (background)
 ```
 
-### 5. Batch operations
+### 6. Batch operations
 
 ```bash
 echo '{"op":"add","type":"module","name":"app"}
@@ -136,7 +148,7 @@ echo '{"op":"add","type":"module","name":"app"}
 
 One graph load/save cycle for all mutations. Partial failure tolerant — errors on individual lines are reported but don't stop processing.
 
-### 6. Export
+### 7. Export
 
 ```bash
 smg export mermaid              # Paste into docs
@@ -156,6 +168,16 @@ smg export json --indent        # Full graph as JSON
 | `smg overview [--top N]` | Graph stats + most connected nodes |
 | `smg diff [REF]` | Structural diff against a git ref (default: HEAD) |
 | `smg analyze [--top N] [--module PREFIX] [--summary]` | Architectural analysis (see below) |
+
+### Enforce
+
+| Command | Purpose |
+|---------|---------|
+| `smg rule add <name> --deny "PATTERN"` | Forbid edges matching a glob pattern |
+| `smg rule add <name> --invariant TYPE` | Require a structural invariant (see below) |
+| `smg rule list` | List all rules |
+| `smg rule rm <name>` | Remove a rule |
+| `smg check [NAME]` | Check all rules (or one). Exit 1 on violation. |
 
 ### Inspect
 
@@ -280,6 +302,58 @@ These patterns, cataloged by [Fowler (1999)][fowler], indicate structural proble
 
 All analyses feed into a synthesized **hotspot ranking** that scores nodes by a weighted combination of complexity, coupling, cohesion, centrality, and importance, surfacing the areas most likely to cause problems.
 
+## Architectural constraints
+
+`smg analyze` tells you what *is* true about your architecture. `smg rule` and `smg check` let you declare what *should* be true — and find where the code departs from intent.
+
+This is inspired by Alloy's approach to software design ([Jackson, 2012][alloy]): state structural properties declaratively, then check them automatically. When a rule is violated, smg reports the specific offending edges or nodes — concrete counterexamples, not just "violated: true."
+
+### Path denial rules
+
+Forbid coupling edges that match a glob pattern:
+
+```bash
+# No module in infra/ may depend on app/
+smg rule add layering --deny "infra.* -> app.*"
+
+# Controllers must not directly call repository code
+smg rule add no-direct-db --deny "*.controller -[calls]-> *.repository"
+```
+
+Patterns use `fnmatch` syntax over fully-qualified node names. The optional `[rel]` filter restricts to a specific relationship type; without it, all coupling edges (calls, imports, inherits, implements, depends_on) are checked.
+
+### Structural invariants
+
+Bind existing analyses to named, persistent rules:
+
+```bash
+smg rule add acyclic --invariant no-cycles
+smg rule add reachable --invariant no-dead-code --entry-points "main,cli.*"
+smg rule add layered --invariant no-layering-violations
+```
+
+| Invariant | What it checks |
+|-----------|---------------|
+| `no-cycles` | No circular dependencies (Tarjan's SCC) |
+| `no-dead-code` | Every non-entry node has at least one incoming coupling edge |
+| `no-layering-violations` | No back-dependency edges violate topological layering |
+
+### Checking rules
+
+```bash
+smg check                  # check all rules
+smg check layering         # check one rule
+smg check --format json    # structured output for agents / CI
+```
+
+Exit code 0 means all rules pass; exit code 1 means at least one violation. This makes `smg check` suitable as a CI gate:
+
+```bash
+smg scan src/ --clean && smg check
+```
+
+Rules are stored in `.smg/rules` (JSONL, same format as the graph) and persist across sessions.
+
 ## Node types
 
 `package`, `module`, `class`, `function`, `method`, `interface`, `variable`, `constant`, `type`, `endpoint`, `config` — plus any custom string.
@@ -330,6 +404,7 @@ smg show run              # Error if multiple matches — lists candidates
 [martin]: https://doi.org/10.1007/978-1-4612-4316-3_9 "Martin (1994). OO Design Quality Metrics: An Analysis of Dependencies."
 [lcom4]: https://scholar.google.com/scholar?q=Hitz+Montazeri+1995+Measuring+Coupling+Cohesion "Hitz & Montazeri (1995). Measuring Coupling and Cohesion in Object-Oriented Systems."
 [fowler]: https://martinfowler.com/books/refactoring.html "Fowler (1999). Refactoring: Improving the Design of Existing Code. Addison-Wesley."
+[alloy]: https://mitpress.mit.edu/9780262017152/ "Jackson (2012). Software Abstractions: Logic, Language, and Analysis. MIT Press."
 
 ## License
 
