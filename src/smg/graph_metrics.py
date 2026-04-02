@@ -432,6 +432,9 @@ def _is_auto_entry_point(name: str, node_type: str) -> bool:
     # Dunder methods (called by the runtime, not by user code)
     if short.startswith("__") and short.endswith("__"):
         return True
+    # Constants (UPPER_CASE) are referenced at runtime, not via call edges
+    if node_type in ("constant", "variable") and short.isupper():
+        return True
     return False
 
 
@@ -466,10 +469,22 @@ def dead_code(
 
     _, rev, coupling_nodes = _coupling_adj(graph)
 
-    dead: list[str] = []
+    # Build set of nodes that have incoming decorates edges
+    decorated: set[str] = set()
+    for edge in graph.all_edges():
+        if edge.rel.value == "decorates":
+            decorated.add(edge.target)
+
+    # Build containment map: child -> parent
+    contained_by: dict[str, str] = {}
+    for edge in graph.all_edges():
+        if edge.rel.value == "contains":
+            contained_by[edge.target] = edge.source
+
+    # First pass: identify candidate dead nodes (ignoring containment)
+    candidates: list[str] = []
     for node in graph.all_nodes():
         name = node.name
-        # Skip structural / entry-point types
         if node.type.value in _STRUCTURAL_TYPES:
             continue
         if node.type.value in _ENTRY_TYPES:
@@ -478,10 +493,22 @@ def dead_code(
             continue
         if auto_entry and _is_auto_entry_point(name, node.type.value):
             continue
-        # Dead if the node has no incoming coupling edges
+        if name in decorated:
+            continue
         incoming = rev.get(name, set())
         if len(incoming) == 0:
-            dead.append(name)
+            candidates.append(name)
+
+    # Second pass: a method/member is only dead if its containing
+    # class is also dead (syntactic call resolution can't trace self.method())
+    candidate_set = set(candidates)
+    dead: list[str] = []
+    for name in candidates:
+        parent = contained_by.get(name)
+        if parent and parent not in candidate_set:
+            # Parent is alive -- this member is likely reachable via self/instance
+            continue
+        dead.append(name)
 
     return sorted(dead)
 
