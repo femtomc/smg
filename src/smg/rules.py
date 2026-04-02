@@ -40,6 +40,7 @@ class Rule:
     pattern: str | None = None
     invariant: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
+    scope: str | None = None  # optional module prefix to scope the rule
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"kind": "rule", "name": self.name, "type": self.type}
@@ -49,6 +50,8 @@ class Rule:
             d["invariant"] = self.invariant
         if self.params:
             d["params"] = self.params
+        if self.scope is not None:
+            d["scope"] = self.scope
         return d
 
     def to_json(self) -> str:
@@ -62,6 +65,7 @@ class Rule:
             pattern=d.get("pattern"),
             invariant=d.get("invariant"),
             params=d.get("params", {}),
+            scope=d.get("scope"),
         )
 
 
@@ -177,8 +181,23 @@ def check_invariant(rule: Rule, graph: SemGraph) -> Violation | None:
     return None
 
 
+def _scope_graph_for_rule(graph: SemGraph, scope: str) -> SemGraph:
+    """Restrict graph to nodes matching a module prefix."""
+    scoped = SemGraph()
+    prefix = scope if scope.endswith(".") else scope + "."
+    for node in graph.all_nodes():
+        if node.name == scope or node.name.startswith(prefix):
+            scoped.add_node(node)
+    for edge in graph.all_edges():
+        if edge.source in scoped.nodes and edge.target in scoped.nodes:
+            scoped.add_edge(edge)
+    return scoped
+
+
 def check_rule(rule: Rule, graph: SemGraph) -> Violation | None:
     """Check a single rule against the graph."""
+    if rule.scope:
+        graph = _scope_graph_for_rule(graph, rule.scope)
     if rule.type == "deny":
         return check_deny(rule, graph)
     elif rule.type == "invariant":

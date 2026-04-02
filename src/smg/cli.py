@@ -63,6 +63,38 @@ def _resolve_or_exit(graph: SemGraph, name: str) -> str:
     sys.exit(EXIT_NOT_FOUND)
 
 
+def _scope_graph(graph: SemGraph, module_filter: str, fmt: str | None = None) -> SemGraph:
+    """Scope a graph to nodes matching a module prefix, with fuzzy suggestion on empty result."""
+    scoped = SemGraph()
+    prefix = module_filter if module_filter.endswith(".") else module_filter + "."
+    for node in graph.all_nodes():
+        if node.name == module_filter or node.name.startswith(prefix):
+            scoped.add_node(node)
+    for edge_obj in graph.all_edges():
+        if edge_obj.source in scoped.nodes and edge_obj.target in scoped.nodes:
+            scoped.add_edge(edge_obj)
+
+    if len(scoped) == 0 and len(graph) > 0:
+        # Suggest alternatives via suffix matching
+        suffix = module_filter.rsplit(".", 1)[-1]
+        candidates = sorted({
+            n.name.rsplit("." + suffix, 1)[0] + "." + suffix
+            for n in graph.all_nodes()
+            if ("." + suffix + ".") in n.name or n.name.endswith("." + suffix)
+        })
+        msg = f"no nodes matching [bold]{module_filter}[/]"
+        if candidates:
+            msg += ". Did you mean:"
+            for c in candidates[:5]:
+                msg += f"\n  {c}"
+        if fmt == "json":
+            err_console.print(f"[yellow]Warning:[/] {msg}")
+        else:
+            err_console.print(f"[yellow]Warning:[/] {msg}")
+
+    return scoped
+
+
 def _auto_fmt(explicit: str | None) -> str:
     """Auto-detect output format: JSON when piped, rich text in terminal."""
     if explicit is not None:
@@ -1069,9 +1101,10 @@ def diff(ref: str, fmt: str | None) -> None:
 @main.command()
 @click.option("--top", "top_n", default=10, type=int, help="Number of top entries to show per ranking")
 @click.option("--module", "module_filter", default=None, help="Scope analysis to nodes under this module/package prefix")
+@click.option("--since", "since_ref", default=None, help="Only analyze nodes/edges added or changed since a git ref (e.g. HEAD~5)")
 @click.option("--summary", is_flag=True, help="Show only hotspots and key findings, skip full listings")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
-def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | None) -> None:
+def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summary: bool, fmt: str | None) -> None:
     """Deep architectural analysis with hotspot detection.
 
     \b
@@ -1102,17 +1135,26 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
 
     # Scope to a module prefix if requested
     if module_filter:
-        from smg.query import subgraph as _subgraph
-        # Build a scoped graph: all nodes whose name starts with the prefix
-        scoped = SemGraph()
-        prefix = module_filter if module_filter.endswith(".") else module_filter + "."
-        for node in graph.all_nodes():
-            if node.name == module_filter or node.name.startswith(prefix):
-                scoped.add_node(node)
-        for edge_obj in graph.all_edges():
-            if edge_obj.source in scoped.nodes and edge_obj.target in scoped.nodes:
-                scoped.add_edge(edge_obj)
-        graph = scoped
+        graph = _scope_graph(graph, module_filter, fmt)
+
+    # Scope to nodes/edges that changed since a git ref
+    delta_names: set[str] | None = None
+    if since_ref:
+        from smg.diff import diff_graphs, load_graph_from_git
+        old_graph = load_graph_from_git(_root, since_ref)
+        if old_graph is None:
+            old_graph = SemGraph()
+        diff_result = diff_graphs(old_graph, graph)
+        # Collect names of added/changed nodes
+        delta_names = set()
+        for n in diff_result.added_nodes:
+            delta_names.add(n.name)
+        for n, _changes in diff_result.changed_nodes:
+            delta_names.add(n.name)
+        # Also include endpoints of added edges
+        for e in diff_result.added_edges:
+            delta_names.add(e.source)
+            delta_names.add(e.target)
 
     use_progress = fmt == "text" and sys.stdout.isatty()
     if use_progress:
@@ -1142,6 +1184,7 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
     # OO metrics
     _step("Computing class metrics (CK suite)...")
     wmc_data = oo_metrics.wmc(graph)
+    max_cc_data = oo_metrics.max_method_cc(graph)
     dit_data = oo_metrics.dit(graph)
     noc_data = oo_metrics.noc(graph)
     cbo_data = oo_metrics.cbo(graph)
@@ -1219,6 +1262,17 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
 
     hotspots.sort(key=lambda h: h["score"], reverse=True)
 
+    # If --since was used, filter results to only delta nodes
+    if delta_names is not None:
+        hotspots = [h for h in hotspots if h["name"] in delta_names]
+        pr_top_candidates = {n for n, _ in sorted(pr.items(), key=lambda x: x[1], reverse=True)} & delta_names
+        bc_top_candidates = {n for n, _ in sorted(bc.items(), key=lambda x: x[1], reverse=True)} & delta_names
+        dead = [n for n in dead if n in delta_names]
+        layer_violations = [v for v in layer_violations if v["source"] in delta_names or v["target"] in delta_names]
+        gods = [g for g in gods if g["name"] in delta_names]
+        envy = [e for e in envy if e["method"] in delta_names]
+        shotgun = [s for s in shotgun if s["name"] in delta_names]
+
     if fmt == "json":
         data: dict = {
             "hotspots": hotspots[:top_n],
@@ -1238,9 +1292,10 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
         if not summary:
             data["classes"] = {
                 name: {
-                    "wmc": wmc_data.get(name, 0), "dit": dit_data.get(name, 0),
-                    "noc": noc_data.get(name, 0), "cbo": cbo_data.get(name, 0),
-                    "rfc": rfc_data.get(name, 0), "lcom4": lcom_data.get(name, 0),
+                    "wmc": wmc_data.get(name, 0), "max_method_cc": max_cc_data.get(name, 0),
+                    "dit": dit_data.get(name, 0), "noc": noc_data.get(name, 0),
+                    "cbo": cbo_data.get(name, 0), "rfc": rfc_data.get(name, 0),
+                    "lcom4": lcom_data.get(name, 0),
                 }
                 for name in sorted(wmc_data.keys())
             }
@@ -1267,8 +1322,13 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
 
     # --- Rich text output ---
 
-    scope_label = f" [dim](scoped to {module_filter})[/]" if module_filter else ""
-    console.print(f"\n[bold]Analysis[/]{scope_label} — {len(graph)} nodes, {len(graph.all_edges())} edges")
+    scope_label = ""
+    if module_filter:
+        scope_label += f" [dim](scoped to {module_filter})[/]"
+    if since_ref:
+        n_delta = len(delta_names) if delta_names else 0
+        scope_label += f" [dim](since {since_ref}, {n_delta} changed)[/]"
+    console.print(f"\n[bold]Analysis[/]{scope_label} -- {len(graph)} nodes, {len(graph.all_edges())} edges")
 
     # Hotspots (always shown)
     if hotspots:
@@ -1390,6 +1450,7 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
         ck_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
         ck_table.add_column("Class", style="bold")
         ck_table.add_column("WMC", justify="right")
+        ck_table.add_column("MaxCC", justify="right")
         ck_table.add_column("CBO", justify="right")
         ck_table.add_column("RFC", justify="right")
         ck_table.add_column("LCOM4", justify="right")
@@ -1400,7 +1461,8 @@ def analyze(top_n: int, module_filter: str | None, summary: bool, fmt: str | Non
             lcom_str = f"[red]{lcom_val}[/]" if lcom_val > 1 else str(lcom_val)
             ck_table.add_row(
                 name,
-                str(wmc_data.get(name, 0)), str(cbo_data.get(name, 0)),
+                str(wmc_data.get(name, 0)), str(max_cc_data.get(name, 0)),
+                str(cbo_data.get(name, 0)),
                 str(rfc_data.get(name, 0)), lcom_str,
                 str(dit_data.get(name, 0)), str(noc_data.get(name, 0)),
             )
@@ -1474,7 +1536,8 @@ def rule() -> None:
 @click.option("--deny", "deny_pattern", default=None, help='Path denial pattern: "source_glob -[rel]-> target_glob"')
 @click.option("--invariant", default=None, type=click.Choice(["no-cycles", "no-dead-code", "no-layering-violations"]), help="Structural invariant to enforce")
 @click.option("--entry-points", default=None, help="Comma-separated entry points for no-dead-code (supports globs)")
-def rule_add(name: str, deny_pattern: str | None, invariant: str | None, entry_points: str | None) -> None:
+@click.option("--scope", default=None, help="Restrict rule to nodes under this module prefix")
+def rule_add(name: str, deny_pattern: str | None, invariant: str | None, entry_points: str | None, scope: str | None) -> None:
     """Add an architectural rule.
 
     \b
@@ -1482,6 +1545,7 @@ def rule_add(name: str, deny_pattern: str | None, invariant: str | None, entry_p
       smg rule add layering --deny "core.* -> ui.*"
       smg rule add no-db-calls --deny "api.* -[calls]-> db.*"
       smg rule add acyclic --invariant no-cycles
+      smg rule add acyclic-server --invariant no-cycles --scope bellboy.server
       smg rule add reachable --invariant no-dead-code --entry-points "main,cli.*"
     """
     from smg.rules import Rule, parse_deny_pattern
@@ -1500,12 +1564,12 @@ def rule_add(name: str, deny_pattern: str | None, invariant: str | None, entry_p
         except ValueError as e:
             err_console.print(f"[red]Error:[/] {e}")
             sys.exit(EXIT_VALIDATION)
-        new_rule = Rule(name=name, type="deny", pattern=deny_pattern)
+        new_rule = Rule(name=name, type="deny", pattern=deny_pattern, scope=scope)
     else:
         params: dict = {}
         if entry_points:
             params["entry_points"] = entry_points
-        new_rule = Rule(name=name, type="invariant", invariant=invariant, params=params)
+        new_rule = Rule(name=name, type="invariant", invariant=invariant, params=params, scope=scope)
 
     _graph, root = _load()
     rules = load_rules(root)
@@ -1546,6 +1610,8 @@ def rule_list(fmt: str | None) -> None:
         if r.params:
             param_str = ", ".join(f"{k}={v}" for k, v in r.params.items())
             constraint = f"{constraint} ({param_str})"
+        if r.scope:
+            constraint = f"{constraint} [dim]scope={r.scope}[/]"
         table.add_row(r.name, r.type, constraint)
     console.print(table)
 
@@ -1751,6 +1817,16 @@ def scan(paths: tuple[str, ...], clean: bool, changed: bool, since: str | None, 
         table.add_row("Edges", f"+{stats.edges_added} -{stats.edges_removed}" if stats.edges_removed else str(stats.edges_added))
         if stats.skipped_edges:
             table.add_row("Skipped", f"{stats.skipped_edges} unresolved")
+        # Warn if most edges were skipped (likely scanned too narrow a scope)
+        total_edges = stats.edges_added + stats.skipped_edges
+        if stats.skipped_edges > 0 and total_edges > 0:
+            skip_ratio = stats.skipped_edges / total_edges
+            if skip_ratio > 0.5:
+                console.print(
+                    f"\n[yellow]Hint:[/] {stats.skipped_edges}/{total_edges} edges were skipped"
+                    " (targets outside the scanned scope). Try scanning a wider directory"
+                    " to resolve cross-module edges."
+                )
         console.print(table)
 
         if stats.orphaned_manual_edges:

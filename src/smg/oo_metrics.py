@@ -87,6 +87,26 @@ def wmc(graph: SemGraph) -> dict[str, int]:
     return result
 
 
+def max_method_cc(graph: SemGraph) -> dict[str, int]:
+    """Max cyclomatic complexity among methods in each class.
+
+    Unlike WMC (which sums complexity), this tracks the single worst
+    method. Useful for detecting improvement when splitting a monolith:
+    WMC may increase (more methods), but max_method_cc should decrease.
+    """
+    result: dict[str, int] = {}
+    for node in graph.all_nodes(type=NodeType.CLASS):
+        methods = _class_methods(graph, node.name)
+        max_cc = 0
+        for m in methods:
+            mnode = graph.get_node(m)
+            if mnode:
+                cc = mnode.metadata.get("metrics", {}).get("cyclomatic_complexity", 1)
+                max_cc = max(max_cc, cc)
+        result[node.name] = max_cc
+    return result
+
+
 def dit(graph: SemGraph) -> dict[str, int]:
     """Depth of Inheritance Tree: max chain length from class to root via INHERITS."""
     result: dict[str, int] = {}

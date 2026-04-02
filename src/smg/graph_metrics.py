@@ -420,9 +420,25 @@ def fan_in_out(graph: SemGraph) -> dict[str, dict[str, int]]:
 # --- Dead code detection ---
 
 
+def _is_auto_entry_point(name: str, node_type: str) -> bool:
+    """Heuristic: detect likely entry points that shouldn't be flagged as dead code."""
+    short = name.rsplit(".", 1)[-1] if "." in name else name
+    # __main__ modules and main() functions
+    if short in ("__main__", "main"):
+        return True
+    # Test functions/classes
+    if short.startswith("test_") or short.startswith("Test"):
+        return True
+    # Dunder methods (called by the runtime, not by user code)
+    if short.startswith("__") and short.endswith("__"):
+        return True
+    return False
+
+
 def dead_code(
     graph: SemGraph,
     entry_points: set[str] | None = None,
+    auto_entry: bool = True,
 ) -> list[str]:
     """Find nodes with zero incoming coupling edges (potential dead code).
 
@@ -430,6 +446,7 @@ def dead_code(
     - Modules and packages (structural containers, not callable code)
     - Nodes explicitly listed in entry_points
     - Nodes whose type is 'endpoint' or 'config' (presumed externally invoked)
+    - When auto_entry=True: __main__, main(), test_*, Test*, and dunder methods
 
     Returns sorted list of node names.
     """
@@ -459,8 +476,9 @@ def dead_code(
             continue
         if name in entry_points:
             continue
-        # Dead if the node participates in coupling but has no incoming,
-        # OR if the node has no coupling edges at all (truly isolated)
+        if auto_entry and _is_auto_entry_point(name, node.type.value):
+            continue
+        # Dead if the node has no incoming coupling edges
         incoming = rev.get(name, set())
         if len(incoming) == 0:
             dead.append(name)
