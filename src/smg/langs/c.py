@@ -1,7 +1,8 @@
 """C and C++ extractor.
 
-Handles .c, .h, .cpp, .hpp, .cc, .cxx, .hxx files.
+Handles .c, .h, .cpp, .hpp, .cc, .cxx, .hxx, .metal files.
 C structs map to CLASS nodes, C++ classes map directly.
+Metal Shading Language (.metal) is parsed as C++ since it shares the syntax.
 """
 from __future__ import annotations
 
@@ -343,7 +344,7 @@ class CHeaderExtractor(_CExtractorBase):
 
 
 class CppExtractor(_CExtractorBase):
-    extensions = [".cpp", ".cc", ".cxx", ".cu"]
+    extensions = [".cpp", ".cc", ".cxx", ".cu", ".metal"]
     branch_map = C_BRANCH_MAP
 
     def __init__(self) -> None:
