@@ -109,6 +109,20 @@ def test_resolve_name_short():
     assert g.resolve_name("Server") == ["app.Server"]
 
 
+def test_resolve_name_dotted_suffix():
+    g = SemGraph()
+    g.add_node(Node(name="pkg.app.Server", type=NodeType.CLASS))
+    g.add_node(Node(name="other.app.Server", type=NodeType.CLASS))
+    assert g.resolve_name("app.Server") == ["other.app.Server", "pkg.app.Server"]
+
+
+def test_resolve_name_exact_beats_suffix():
+    g = SemGraph()
+    g.add_node(Node(name="app.Server", type=NodeType.CLASS))
+    g.add_node(Node(name="pkg.app.Server", type=NodeType.CLASS))
+    assert g.resolve_name("app.Server") == ["app.Server"]
+
+
 def test_resolve_name_ambiguous():
     g = SemGraph()
     g.add_node(Node(name="a.Foo", type=NodeType.CLASS))

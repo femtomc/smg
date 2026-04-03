@@ -73,19 +73,14 @@ def save_graph(graph: SemGraph, root: Path) -> None:
     smg_dir = root / SMG_DIR
     graph_file = smg_dir / GRAPH_FILE
 
-    lines: list[str] = []
-    # Nodes first (sorted by name), then edges (sorted by key)
-    for node in graph.all_nodes():
-        lines.append(node.to_json())
-    for edge in graph.all_edges():
-        lines.append(edge.to_json())
-
     # Atomic write: write to temp file, then rename
     fd, tmp_path = tempfile.mkstemp(dir=smg_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            for line in lines:
-                f.write(line + "\n")
+            for node in graph.all_nodes():
+                f.write(node.to_json() + "\n")
+            for edge in graph.all_edges():
+                f.write(edge.to_json() + "\n")
         os.replace(tmp_path, graph_file)
     except BaseException:
         # Clean up temp file on failure

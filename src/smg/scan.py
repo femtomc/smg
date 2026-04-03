@@ -177,12 +177,10 @@ def scan_paths(
     # Smart clean phase: only remove scan-sourced nodes from files about to be rescanned.
     # Collect orphaned manual edges before cascade-deleting nodes.
     if clean:
-        rel_paths = set()
-        for fpath in files:
-            try:
-                rel_paths.add(str(fpath.relative_to(root)))
-            except ValueError:
-                rel_paths.add(str(fpath))
+        rel_paths = {
+            str(fpath.relative_to(root)) if fpath.is_relative_to(root) else str(fpath)
+            for fpath in files
+        }
         to_remove = [
             name for name, node in list(graph.nodes.items())
             if node.file is not None
@@ -191,15 +189,29 @@ def scan_paths(
         ]
         for name in to_remove:
             # Before removing, check for manual edges that will be orphaned
-            for edge in graph.incoming(name) + graph.outgoing(name):
-                if edge.metadata.get("source") == "manual":
-                    stats.orphaned_manual_edges.append({
-                        "source": edge.source,
-                        "rel": edge.rel.value,
-                        "target": edge.target,
-                        "reason": f"{'source' if edge.source == name else 'target'} node removed",
-                    })
-                    stats.edges_removed += 1
+            seen_manual_edges: set[tuple[str, str, str]] = set()
+            for edge in graph.iter_incoming(name):
+                if edge.metadata.get("source") != "manual" or edge.key in seen_manual_edges:
+                    continue
+                seen_manual_edges.add(edge.key)
+                stats.orphaned_manual_edges.append({
+                    "source": edge.source,
+                    "rel": edge.rel.value,
+                    "target": edge.target,
+                    "reason": f"{'source' if edge.source == name else 'target'} node removed",
+                })
+                stats.edges_removed += 1
+            for edge in graph.iter_outgoing(name):
+                if edge.metadata.get("source") != "manual" or edge.key in seen_manual_edges:
+                    continue
+                seen_manual_edges.add(edge.key)
+                stats.orphaned_manual_edges.append({
+                    "source": edge.source,
+                    "rel": edge.rel.value,
+                    "target": edge.target,
+                    "reason": f"{'source' if edge.source == name else 'target'} node removed",
+                })
+                stats.edges_removed += 1
             stats.nodes_removed += 1
             graph.remove_node(name)
 
@@ -305,10 +317,10 @@ def scan_paths(
             stats.edges_added += 1
 
     # Post-pass: compute fan-in/fan-out for functions and methods
-    for node in graph.all_nodes():
+    for node in graph.iter_nodes():
         if node.type.value in ("function", "method"):
-            fan_in = len(graph.incoming(node.name, rel=RelType.CALLS))
-            fan_out = len(graph.outgoing(node.name, rel=RelType.CALLS))
+            fan_in = graph.incoming_count(node.name, rel=RelType.CALLS)
+            fan_out = graph.outgoing_count(node.name, rel=RelType.CALLS)
             node.metadata.setdefault("metrics", {}).update({
                 "fan_in": fan_in,
                 "fan_out": fan_out,

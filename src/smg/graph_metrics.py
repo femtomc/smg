@@ -30,7 +30,7 @@ def _coupling_adj(graph: SemGraph) -> tuple[dict[str, set[str]], dict[str, set[s
     rev: dict[str, set[str]] = defaultdict(set)
     nodes: set[str] = set()
 
-    for edge in graph.all_edges():
+    for edge in graph.iter_edges(rel_types=_COUPLING_RELS):
         if edge.rel.value in _COUPLING_RELS:
             fwd[edge.source].add(edge.target)
             rev[edge.target].add(edge.source)
@@ -45,7 +45,7 @@ def _undirected_coupling_adj(graph: SemGraph) -> tuple[dict[str, set[str]], set[
     adj: dict[str, set[str]] = defaultdict(set)
     nodes: set[str] = set()
 
-    for edge in graph.all_edges():
+    for edge in graph.iter_edges(rel_types=_COUPLING_RELS):
         if edge.rel.value in _COUPLING_RELS:
             adj[edge.source].add(edge.target)
             adj[edge.target].add(edge.source)
@@ -234,22 +234,26 @@ def pagerank(
     if n == 0:
         return {}
 
-    node_list = sorted(nodes)
+    node_list = tuple(sorted(nodes))
     rank = {node: 1.0 / n for node in node_list}
+    out_degree = {node: len(fwd.get(node, ())) for node in node_list}
+    dangling_nodes = tuple(node for node in node_list if out_degree[node] == 0)
+    base_rank = (1 - damping) / n
 
     for _ in range(iterations):
         # Collect "leaked" rank from dangling nodes (no outgoing edges)
-        dangling_sum = sum(rank[node] for node in node_list if not fwd.get(node))
+        dangling_sum = sum(rank[node] for node in dangling_nodes)
+        leaked_rank = dangling_sum / n
 
         new_rank: dict[str, float] = {}
         for node in node_list:
             incoming_sum = 0.0
-            for source in rev.get(node, set()):
-                out_degree = len(fwd.get(source, set()))
-                if out_degree > 0:
-                    incoming_sum += rank[source] / out_degree
+            for source in rev.get(node, ()):
+                degree = out_degree[source]
+                if degree > 0:
+                    incoming_sum += rank[source] / degree
             # Redistribute dangling rank evenly + teleport
-            new_rank[node] = (1 - damping) / n + damping * (incoming_sum + dangling_sum / n)
+            new_rank[node] = base_rank + damping * (incoming_sum + leaked_rank)
         rank = new_rank
 
     return rank
@@ -268,38 +272,42 @@ def betweenness_centrality(graph: SemGraph) -> dict[str, float]:
     if n < 3:
         return {node: 0.0 for node in nodes}
 
-    node_list = sorted(nodes)
+    node_list = tuple(sorted(nodes))
     bc: dict[str, float] = {node: 0.0 for node in node_list}
 
     for s in node_list:
         # BFS from s
         stack: list[str] = []
-        predecessors: dict[str, list[str]] = {node: [] for node in node_list}
-        sigma: dict[str, int] = {node: 0 for node in node_list}
+        predecessors: dict[str, list[str]] = defaultdict(list)
+        sigma: dict[str, int] = {s: 1}
+        dist: dict[str, int] = {s: 0}
         sigma[s] = 1
-        dist: dict[str, int] = {node: -1 for node in node_list}
-        dist[s] = 0
         queue: deque[str] = deque([s])
+        adj_get = adj.get
 
         while queue:
             v = queue.popleft()
             stack.append(v)
-            for w in adj.get(v, set()):
-                if dist[w] < 0:
-                    dist[w] = dist[v] + 1
+            next_distance = dist[v] + 1
+            for w in adj_get(v, ()):
+                current_distance = dist.get(w)
+                if current_distance is None:
+                    dist[w] = next_distance
                     queue.append(w)
-                if dist[w] == dist[v] + 1:
-                    sigma[w] += sigma[v]
+                    current_distance = next_distance
+                if current_distance == next_distance:
+                    sigma[w] = sigma.get(w, 0) + sigma[v]
                     predecessors[w].append(v)
 
         # Back-propagation
-        delta: dict[str, float] = {node: 0.0 for node in node_list}
+        delta: dict[str, float] = {}
         while stack:
             w = stack.pop()
-            for v in predecessors[w]:
-                delta[v] += (sigma[v] / sigma[w]) * (1 + delta[w])
+            coeff = (1.0 + delta.get(w, 0.0)) / sigma[w]
+            for v in predecessors.get(w, ()):
+                delta[v] = delta.get(v, 0.0) + sigma[v] * coeff
             if w != s:
-                bc[w] += delta[w]
+                bc[w] += delta.get(w, 0.0)
 
     # Normalize
     norm = (n - 1) * (n - 2)
@@ -370,7 +378,7 @@ def detect_bridges(graph: SemGraph) -> list[tuple[str, str]]:
         dfs_stack: list[tuple[str, str | None, list[str], int]] = []
         disc[start] = low[start] = timer[0]
         timer[0] += 1
-        neighbors = sorted(adj.get(start, set()))
+        neighbors = tuple(adj.get(start, ()))
         dfs_stack.append((start, None, neighbors, 0))
 
         while dfs_stack:
@@ -383,7 +391,7 @@ def detect_bridges(graph: SemGraph) -> list[tuple[str, str]]:
                 if w not in disc:
                     disc[w] = low[w] = timer[0]
                     timer[0] += 1
-                    dfs_stack.append((w, v, sorted(adj.get(w, set())), 0))
+                    dfs_stack.append((w, v, tuple(adj.get(w, ())), 0))
                 elif w != parent:
                     low[v] = min(low[v], disc[w])
             else:
@@ -495,13 +503,13 @@ def dead_code(
 
     # Build set of nodes that have incoming decorates edges
     decorated: set[str] = set()
-    for edge in graph.all_edges():
+    for edge in graph.iter_edges():
         if edge.rel.value == "decorates":
             decorated.add(edge.target)
 
     # Build containment map: child -> parent
     contained_by: dict[str, str] = {}
-    for edge in graph.all_edges():
+    for edge in graph.iter_edges(rel_types={RelType.CONTAINS.value}):
         if edge.rel.value == "contains":
             contained_by[edge.target] = edge.source
 
@@ -559,7 +567,7 @@ def god_files(
     """
     # Group nodes by file
     file_nodes: dict[str, list] = defaultdict(list)
-    for node in graph.all_nodes():
+    for node in graph.iter_nodes():
         if node.file:
             file_nodes[node.file].append(node)
 
@@ -568,7 +576,7 @@ def god_files(
 
     # Build node -> file mapping for concern counting
     node_to_file: dict[str, str] = {}
-    for node in graph.all_nodes():
+    for node in graph.iter_nodes():
         if node.file:
             node_to_file[node.name] = node.file
 
@@ -587,7 +595,7 @@ def god_files(
         # Count distinct external files this file's nodes couple to
         external_files: set[str] = set()
         for node in nodes:
-            for edge in graph.outgoing(node.name):
+            for edge in graph.iter_outgoing(node.name):
                 if edge.rel.value in _COUPLING_RELS:
                     target_file = node_to_file.get(edge.target)
                     if target_file and target_file != file_path:
@@ -633,9 +641,7 @@ def layering_violations(graph: SemGraph) -> list[dict]:
         return []
 
     violations: list[dict] = []
-    for edge in graph.all_edges():
-        if edge.rel.value not in _COUPLING_RELS:
-            continue
+    for edge in graph.iter_edges(rel_types=_COUPLING_RELS):
         sl = layers.get(edge.source)
         tl = layers.get(edge.target)
         if sl is not None and tl is not None and sl <= tl:
@@ -667,7 +673,7 @@ def hits(
     if not nodes:
         return {}
 
-    node_list = sorted(nodes)
+    node_list = tuple(sorted(nodes))
     hub = {n: 1.0 for n in node_list}
     auth = {n: 1.0 for n in node_list}
 

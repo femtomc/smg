@@ -87,7 +87,7 @@ def watch_and_scan(
 
     def do_rescan(files: list[Path]) -> None:
         old_graph = load_graph(root)
-        graph = load_graph(root)
+        graph = old_graph.clone()
         stats = scan_paths(graph, root, files, clean=True)
         save_graph(graph, root)
         result = diff_graphs(old_graph, graph)

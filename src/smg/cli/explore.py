@@ -539,7 +539,6 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     # OO metrics
     _step("Computing class metrics (CK suite)...")
     wmc_data = oo_metrics.wmc(graph)
-    max_cc_data = oo_metrics.max_method_cc(graph)
     dit_data = oo_metrics.dit(graph)
     noc_data = oo_metrics.noc(graph)
     cbo_data = oo_metrics.cbo(graph)
@@ -549,20 +548,28 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     martin_data = oo_metrics.martin_metrics(graph)
     _step("Checking SDP violations...")
     sdp = oo_metrics.sdp_violations(graph)
-    _step("Computing fan-in/fan-out...")
-    fio = graph_metrics.fan_in_out(graph)
     _step("Detecting dead code...")
     dead = graph_metrics.dead_code(graph)
     _step("Checking layering violations...")
     layer_violations = graph_metrics.layering_violations(graph)
-    _step("Computing HITS (hub/authority)...")
-    hits_data = graph_metrics.hits(graph)
     _step("Detecting code smells...")
     gods = oo_metrics.god_classes(graph)
     envy = oo_metrics.feature_envy(graph)
     shotgun = oo_metrics.shotgun_surgery(graph)
     _step("Detecting god files...")
     god_files = graph_metrics.god_files(graph)
+
+    max_cc_data: dict[str, int] = {}
+    fio: dict[str, dict[str, int]] = {}
+    hits_data: dict[str, dict[str, float]] = {}
+    if not summary:
+        _step("Computing max method complexity...")
+        max_cc_data = oo_metrics.max_method_cc(graph)
+        _step("Computing fan-in/fan-out...")
+        fio = graph_metrics.fan_in_out(graph)
+        _step("Computing HITS (hub/authority)...")
+        hits_data = graph_metrics.hits(graph)
+
     _step("Computing hotspots...")
 
     if use_progress:
@@ -622,15 +629,14 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     # If --since was used, filter results to only delta nodes
     if delta_names is not None:
         hotspots = [h for h in hotspots if h["name"] in delta_names]
-        pr_top_candidates = {n for n, _ in sorted(pr.items(), key=lambda x: x[1], reverse=True)} & delta_names
-        bc_top_candidates = {n for n, _ in sorted(bc.items(), key=lambda x: x[1], reverse=True)} & delta_names
         dead = [n for n in dead if n in delta_names]
         layer_violations = [v for v in layer_violations if v["source"] in delta_names or v["target"] in delta_names]
         gods = [g for g in gods if g["name"] in delta_names]
         envy = [e for e in envy if e["method"] in delta_names]
         shotgun = [s for s in shotgun if s["name"] in delta_names]
         # god_files: keep if any delta node lives in that file
-        delta_files = {node_to_file for n in delta_names if (node_to_file := next((nd.file for nd in graph.all_nodes() if nd.name == n and nd.file), None))}
+        node_files = {node.name: node.file for node in graph.iter_nodes() if node.file}
+        delta_files = {node_files[n] for n in delta_names if n in node_files}
         god_files = [gf for gf in god_files if gf["file"] in delta_files]
 
     if fmt == "json":

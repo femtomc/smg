@@ -40,7 +40,7 @@ def shortest_path(graph: SemGraph, source: str, target: str) -> list[str] | None
     while queue:
         path = queue.popleft()
         current = path[-1]
-        for neighbor in graph.neighbors(current, direction="both"):
+        for neighbor in graph.iter_neighbors(current, direction="both"):
             if neighbor == target:
                 return path + [neighbor]
             if neighbor not in visited:
@@ -66,7 +66,7 @@ def subgraph(
     for _ in range(depth):
         next_frontier: set[str] = set()
         for node_name in frontier:
-            for neighbor in graph.neighbors(node_name, direction=direction):
+            for neighbor in graph.iter_neighbors(node_name, direction=direction):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     next_frontier.add(neighbor)
@@ -81,7 +81,7 @@ def subgraph(
         if node is not None:
             sub.add_node(node)
 
-    for edge in graph.all_edges():
+    for edge in graph.iter_edges():
         if edge.source in visited and edge.target in visited:
             sub.add_edge(edge)
 
@@ -101,7 +101,7 @@ def impact(
         current, depth = queue.popleft()
         if max_depth is not None and depth >= max_depth:
             continue
-        for edge in graph.incoming(current):
+        for edge in graph.iter_incoming(current):
             if edge.source not in visited:
                 visited.add(edge.source)
                 queue.append((edge.source, depth + 1))
@@ -114,10 +114,13 @@ def containment_path(graph: SemGraph, name: str) -> list[str]:
     path = [name]
     current = name
     while True:
-        parents = [e.source for e in graph.incoming(current, rel=RelType.CONTAINS)]
-        if not parents:
+        parent = next(
+            (edge.source for edge in graph.iter_incoming(current, rel=RelType.CONTAINS)),
+            None,
+        )
+        if parent is None:
             break
-        current = parents[0]
+        current = parent
         path.append(current)
     path.reverse()
     return path
@@ -156,7 +159,7 @@ def _bfs_outgoing(
         current, depth = queue.popleft()
         if max_depth is not None and depth >= max_depth:
             continue
-        for edge in graph.outgoing(current):
+        for edge in graph.iter_outgoing(current):
             if edge.rel.value in rel_types and edge.target not in visited:
                 visited.add(edge.target)
                 queue.append((edge.target, depth + 1))
@@ -177,7 +180,7 @@ def _bfs_incoming(
         current, depth = queue.popleft()
         if max_depth is not None and depth >= max_depth:
             continue
-        for edge in graph.incoming(current):
+        for edge in graph.iter_incoming(current):
             if edge.rel.value in rel_types and edge.source not in visited:
                 visited.add(edge.source)
                 queue.append((edge.source, depth + 1))
