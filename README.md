@@ -14,10 +14,11 @@ uv tool install smg \
   --with tree-sitter-typescript \
   --with tree-sitter-c \
   --with tree-sitter-zig \
+  --with xxhash \
   --with watchdog
 
 # Python only
-uv tool install smg --from git+https://github.com/femtomc/smg --with tree-sitter --with tree-sitter-python
+uv tool install smg --from git+https://github.com/femtomc/smg --with tree-sitter --with tree-sitter-python --with xxhash
 ```
 
 ## Quick start
@@ -29,13 +30,20 @@ smg scan src/
 
 # Ask questions
 smg about MyClass           # What is this?
+smg usages MyClass          # Where is it used?
 smg impact MyClass          # What breaks if I change it?
 smg between api.routes db   # How do these relate?
 smg overview                # Orient me
-smg analyze                 # Architectural analysis
+
+# Analyze
+smg analyze                 # Architectural analysis with hotspot detection
+smg diff                    # What changed? (with rename/move detection)
+smg blame MyClass           # Who last touched this?
+smg context MyClass --tokens 8000  # Pack source for an LLM prompt
+
+# Enforce
 smg rule add acyclic --invariant no-cycles
 smg check                   # Enforce architectural rules
-smg diff                    # What changed since last commit?
 ```
 
 ## Supported languages
@@ -47,6 +55,7 @@ smg diff                    # What changed since last commit?
 | TypeScript | `.ts`, `.tsx` | `tree-sitter-typescript` |
 | C/C++ | `.c`, `.h`, `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx` | `tree-sitter-c` |
 | CUDA | `.cu`, `.cuh` | `tree-sitter-c` (C++ parser) |
+| Metal | `.metal` | `tree-sitter-cpp` |
 | Zig | `.zig` | `tree-sitter-zig` |
 
 All languages extract: classes/structs, functions, methods, constants, containment, imports, inheritance, call graph, and per-function metrics. Adding a language means writing a `langs/<language>.py` extractor and a `BranchMap` -- the metrics engine and scanner are shared.
@@ -60,6 +69,15 @@ There are three ways to populate the graph:
 1. **`smg scan`** -- tree-sitter parses source files and extracts symbols, containment, imports, inheritance, and call graph automatically.
 2. **Manual CLI** -- agents or humans add nodes and edges directly with `smg add` and `smg link`.
 3. **Both** -- scan for the baseline, then layer on domain-specific relationships (e.g. "tests", "endpoint", custom types).
+
+### Structural hashing
+
+During extraction, every function, method, and class gets two hashes stored in its metadata:
+
+- **Content hash** -- xxHash64 of the entity's raw source bytes. If two entities have the same content hash, their source code is identical.
+- **Structure hash** -- xxHash64 of a normalized AST walk that skips comments, identifiers, and literals but preserves node types and nesting. If two entities have the same structure hash, they have the same control flow shape even if variable names, strings, or comments differ.
+
+These hashes power rename/move detection in `smg diff` (see below). They are computed automatically during scan and persisted in the graph.
 
 ### Provenance tracking
 
@@ -100,15 +118,34 @@ smg about auth.service          # Context card: type, file, connections, contain
 ### 2. Investigate
 
 ```bash
+smg usages auth.service         # Who uses this? (all direct references)
 smg impact auth.service         # What depends on this? (reverse transitive)
 smg between api.routes db.models  # How do these connect?
 smg diff                        # What changed structurally since last commit?
-smg analyze                     # Cycles, dead code, hotspots, code smells
+smg blame auth.service          # Who last touched this and when?
+smg analyze                     # Cycles, dead code, hotspots, code smells, churn
 smg analyze --summary --top 5   # Key findings only
 smg query deps auth.service     # What does this depend on? (forward transitive)
 ```
 
-### 3. Enforce
+### 3. Build context
+
+When preparing a prompt for an LLM, `smg context` packs relevant source code into a token budget:
+
+```bash
+smg context auth.service --tokens 8000
+```
+
+This walks outward from the target entity in the dependency graph and greedily includes source code, prioritizing by proximity:
+
+1. **Target entity** -- full source (always included)
+2. **Direct dependencies and dependents** (1-hop) -- full source, downgraded to signature if over budget
+3. **2-hop neighbors** -- signature only (just the function/class declaration)
+4. **3-hop neighbors** -- summary only (name, type, file location, docstring)
+
+If the budget fills up at any tier, remaining entries are downgraded to the next level. Output is structured JSON when piped, syntax-highlighted source when in terminal. The token counter defaults to `len(text) / 4` (~4 chars per token) but is pluggable via the library API.
+
+### 4. Enforce
 
 ```bash
 smg rule add layering --deny "infra.* -> app.*"
@@ -118,7 +155,7 @@ smg check                       # check all rules (exit 1 on violation)
 smg check layering              # check a specific rule
 ```
 
-### 4. Inspect
+### 5. Inspect
 
 ```bash
 smg show auth.service           # Node details + direct edges + metrics
@@ -127,7 +164,7 @@ smg query incoming auth.service --rel calls  # What calls it?
 smg list --type class           # All classes in the graph
 ```
 
-### 5. Mutate
+### 6. Mutate
 
 ```bash
 smg add endpoint /api/login --doc "Login endpoint" --meta method=POST
@@ -138,7 +175,7 @@ smg scan --since HEAD~3         # Incremental: since a specific ref
 smg watch src/                  # Auto-rescan on file changes (background)
 ```
 
-### 6. Batch operations
+### 7. Batch operations
 
 ```bash
 echo '{"op":"add","type":"module","name":"app"}
@@ -148,7 +185,7 @@ echo '{"op":"add","type":"module","name":"app"}
 
 One graph load/save cycle for all mutations. Partial failure tolerant -- errors on individual lines are reported but don't stop processing.
 
-### 7. Export
+### 8. Export
 
 ```bash
 smg export mermaid              # Paste into docs
@@ -163,11 +200,14 @@ smg export json --indent        # Full graph as JSON
 | Command | Purpose |
 |---------|---------|
 | `smg about <name> [--depth 0\|1\|2]` | Context card with progressive detail |
+| `smg usages <name>` | Where is X used? All direct references with source location |
 | `smg impact <name> [--depth N]` | Reverse transitive impact analysis |
 | `smg between <A> <B>` | Shortest path + direct edges |
 | `smg overview [--top N]` | Graph stats + most connected nodes |
-| `smg diff [REF]` | Structural diff against a git ref (default: HEAD) |
-| `smg analyze [--top N] [--module PREFIX] [--summary]` | Architectural analysis (see below) |
+| `smg diff [REF]` | Structural diff with rename/move detection (default: HEAD) |
+| `smg analyze [--top N] [--module PREFIX] [--summary] [--churn-days N]` | Architectural analysis (see below) |
+| `smg context <name> [--tokens N]` | Pack source code for LLM context within a token budget |
+| `smg blame <name\|file>` | Entity-level git blame: who last touched this? |
 
 ### Enforce
 
@@ -219,6 +259,42 @@ smg export json --indent        # Full graph as JSON
 | `smg export dot` | Graphviz DOT |
 | `smg export text` | Human-readable listing |
 
+## Structural diff
+
+`smg diff` compares the current graph against a git ref and reports structural changes: added, removed, changed, and **renamed/moved** nodes and edges.
+
+```bash
+smg diff              # vs HEAD (last commit)
+smg diff HEAD~3       # vs 3 commits ago
+smg diff main         # vs another branch
+```
+
+Rename and move detection uses a three-phase matching algorithm on unmatched added/removed nodes:
+
+1. **Content hash match** -- if a removed node and an added node have identical source bytes (same content hash), the entity was purely renamed or moved with no code changes. Reported as an "exact" match.
+2. **Structure hash match** -- if there's a unique structural match (same AST shape but different content, e.g. a variable was renamed inside the function), the entity was renamed with minor edits. Reported as a "structural" match.
+3. **Fuzzy name similarity** -- for still-unmatched entities of the same type, smg computes [Jaccard similarity][jaccard] on whitespace-split tokens of their fully-qualified names. Pairs above 0.8 similarity are classified as renamed/moved. This catches cases where both the entity's name and its body changed significantly but the name tokens mostly overlap (e.g. `app.utils.parse_config` → `app.helpers.parse_config`).
+
+Anything unmatched after all three phases is reported as a plain addition or deletion.
+
+## Entity-level blame
+
+`smg blame` maps graph entities to the most recent git commit that touched their source lines:
+
+```bash
+# Single entity
+smg blame SemGraph
+# smg.graph.SemGraph [class]
+#   src/smg/graph.py:14-251
+#   69a55085a058 user@email.com (2024-01-15)
+#   Optimize scan and analysis hot paths
+
+# All entities in a file
+smg blame src/smg/graph.py
+```
+
+For a single entity, it runs `git log -1 -L <start>,<end>:<file>` to find the commit that last modified the entity's line range. For a file, it blames every entity in that file and displays a table sorted by line number. Output is JSON when piped.
+
 ## Per-function metrics
 
 Every function and method node includes AST-based metrics in its metadata, computed automatically during scan:
@@ -249,12 +325,14 @@ for n in sorted(json.load(sys.stdin),
 
 ## Architectural analysis
 
-`smg analyze` runs graph-theoretic, OO, and smell-detection analyses in a single pass.
+`smg analyze` runs graph-theoretic, OO, smell-detection, and git-churn analyses in a single pass.
 
 ```bash
 smg analyze                        # all analyses
 smg analyze --module auth          # scope to auth.* nodes
+smg analyze --since HEAD~5         # only analyze changed nodes
 smg analyze --summary --top 5      # hotspots and key findings only
+smg analyze --churn-days 180       # look back 6 months for churn (default: 90)
 smg analyze --format json          # structured output for agents
 ```
 
@@ -292,15 +370,42 @@ The CK suite ([Chidamber & Kemerer, 1994][ck]) and Martin's package metrics ([Ma
 
 ### Code smells
 
-These patterns, cataloged by [Fowler (1999)][fowler], indicate structural problems that make code harder to change.
+These patterns indicate structural problems that make code harder to change.
 
 | Smell | Detection rule | What it means |
 |-------|---------------|---------------|
-| God Class | WMC >= 20 AND CBO >= 5 AND LCOM4 >= 2 | A class with too many responsibilities -- complex, coupled, and incohesive. Should be split. |
+| God Class | WMC >= 20 AND CBO >= 5 AND LCOM4 >= 2 | A class with too many responsibilities -- complex, coupled, and incohesive. Should be split. [Fowler (1999)][fowler] |
 | Feature Envy | Method references another class's members more than its own (>= 2 external refs) | The method probably belongs in the other class. Moving it improves cohesion in both classes. |
 | Shotgun Surgery | Function/method with coupling fan-out >= 7 | Changing this function likely requires coordinated changes across many dependents. Reducing fan-out isolates change. |
+| God File | Module with high total cyclomatic complexity, many functions, or many external concerns | A file doing too much. Split into focused modules to reduce cognitive load and merge conflicts. |
 
-All analyses feed into a synthesized **hotspot ranking** that scores nodes by a weighted combination of complexity, coupling, cohesion, centrality, and importance, surfacing the areas most likely to cause problems.
+### Git churn
+
+`smg analyze` integrates temporal data from git history alongside the static graph analysis. For each entity in the graph, it counts how many commits modified the entity's line range over a configurable time window (default: 90 days).
+
+Entities that are both structurally central (high complexity, high coupling) AND frequently changed are the most dangerous hotspots -- they are hard to modify correctly AND are being modified often.
+
+Churn feeds into the hotspot ranking:
+- **Class-level**: entities with > 10 touches get a churn bonus in their hotspot score.
+- **Function-level**: functions with > 5 touches AND cyclomatic complexity > 10 are surfaced as churn hotspots even if they don't appear in the class-level rankings.
+
+```bash
+smg analyze --churn-days 30   # last month only
+smg analyze --churn-days 365  # full year
+```
+
+### Hotspot synthesis
+
+All analyses feed into a composite **hotspot ranking** that scores nodes by a weighted combination of:
+
+- Complexity (WMC, cyclomatic complexity)
+- Coupling (CBO, fan-out)
+- Cohesion (LCOM4)
+- Centrality (betweenness, PageRank)
+- Churn (commit touch frequency)
+- Module distance from the main sequence
+
+The resulting ranked list surfaces the areas most likely to cause problems when modified.
 
 ## Architectural constraints
 
@@ -367,7 +472,7 @@ Rules are stored in `.smg/rules` (JSONL, same format as the graph) and persist a
 `.smg/graph.jsonl` -- one JSON object per line:
 
 ```jsonl
-{"kind":"node","name":"app.core.Engine","type":"class","file":"src/app/core.py","line":12,"docstring":"The engine.","metadata":{"source":"scan","metrics":{...}}}
+{"kind":"node","name":"app.core.Engine","type":"class","file":"src/app/core.py","line":12,"docstring":"The engine.","metadata":{"source":"scan","content_hash":"a1b2c3d4e5f6a7b8","structure_hash":"f8e7d6c5b4a39281","metrics":{...}}}
 {"kind":"edge","source":"app.core","rel":"contains","target":"app.core.Engine","metadata":{"source":"scan"}}
 ```
 
@@ -394,15 +499,16 @@ smg show run              # Error if multiple matches -- lists candidates
 
 ## References
 
-- McCabe, T.J. (1976). [A Complexity Measure](https://doi.org/10.1109/TSE.1976.233837). *IEEE TSE*, SE-2(4), 308–320.
-- Tarjan, R.E. (1972). [Depth-First Search and Linear Graph Algorithms](https://doi.org/10.1137/0201010). *SIAM Journal on Computing*, 1(2), 146–160.
-- Seidman, S.B. (1983). [Network Structure and Minimum Degree](https://doi.org/10.1016/0378-8733(83)90028-X). *Social Networks*, 5(3), 269–287.
-- Chidamber, S.R. & Kemerer, C.F. (1994). [A Metrics Suite for Object Oriented Design](https://doi.org/10.1109/32.295895). *IEEE TSE*, 20(6), 476–493.
+- McCabe, T.J. (1976). [A Complexity Measure](https://doi.org/10.1109/TSE.1976.233837). *IEEE TSE*, SE-2(4), 308--320.
+- Tarjan, R.E. (1972). [Depth-First Search and Linear Graph Algorithms](https://doi.org/10.1137/0201010). *SIAM Journal on Computing*, 1(2), 146--160.
+- Seidman, S.B. (1983). [Network Structure and Minimum Degree](https://doi.org/10.1016/0378-8733(83)90028-X). *Social Networks*, 5(3), 269--287.
+- Chidamber, S.R. & Kemerer, C.F. (1994). [A Metrics Suite for Object Oriented Design](https://doi.org/10.1109/32.295895). *IEEE TSE*, 20(6), 476--493.
 - Martin, R.C. (1994). [OO Design Quality Metrics: An Analysis of Dependencies](https://doi.org/10.1007/978-1-4612-4316-3_9). *OOPSLA '94 Workshop*.
 - Hitz, M. & Montazeri, B. (1995). [Measuring Coupling and Cohesion in Object-Oriented Systems](https://scholar.google.com/scholar?q=Hitz+Montazeri+1995+Measuring+Coupling+Cohesion). *Proc. ISACC '95*.
-- Brin, S. & Page, L. (1998). [The Anatomy of a Large-Scale Hypertextual Web Search Engine](https://doi.org/10.1016/S0169-7552(98)00110-X). *Computer Networks*, 30(1–7), 107–117.
+- Jaccard, P. (1912). [The Distribution of the Flora in the Alpine Zone](https://doi.org/10.1111/j.1469-8137.1912.tb05611.x). *New Phytologist*, 11(2), 37--50.
+- Brin, S. & Page, L. (1998). [The Anatomy of a Large-Scale Hypertextual Web Search Engine](https://doi.org/10.1016/S0169-7552(98)00110-X). *Computer Networks*, 30(1--7), 107--117.
 - Fowler, M. (1999). [Refactoring: Improving the Design of Existing Code](https://martinfowler.com/books/refactoring.html). Addison-Wesley.
-- Brandes, U. (2001). [A Faster Algorithm for Betweenness Centrality](https://doi.org/10.1080/0022250X.2001.9990249). *Journal of Mathematical Sociology*, 25(2), 163–177.
+- Brandes, U. (2001). [A Faster Algorithm for Betweenness Centrality](https://doi.org/10.1080/0022250X.2001.9990249). *Journal of Mathematical Sociology*, 25(2), 163--177.
 - Jackson, D. (2012). [Software Abstractions: Logic, Language, and Analysis](https://mitpress.mit.edu/9780262017152/). MIT Press.
 - Campbell, G.A. (2018). [Cognitive Complexity: An Overview and Evaluation](https://doi.org/10.1145/3194164.3194186). *Proc. TechDebt '18*, ACM.
 
@@ -413,6 +519,7 @@ smg show run              # Error if multiple matches -- lists candidates
 [ck]: https://doi.org/10.1109/32.295895
 [martin]: https://doi.org/10.1007/978-1-4612-4316-3_9
 [lcom4]: https://scholar.google.com/scholar?q=Hitz+Montazeri+1995+Measuring+Coupling+Cohesion
+[jaccard]: https://doi.org/10.1111/j.1469-8137.1912.tb05611.x
 [pagerank]: https://doi.org/10.1016/S0169-7552(98)00110-X
 [fowler]: https://martinfowler.com/books/refactoring.html
 [brandes]: https://doi.org/10.1080/0022250X.2001.9990249
