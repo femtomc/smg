@@ -32,7 +32,7 @@ click.rich_click.STYLE_SWITCH = "bold green"
 click.rich_click.STYLE_METAVAR = "dim"
 click.rich_click.COMMAND_GROUPS = {
     "smg": [
-        {"name": "Explore", "commands": ["about", "usages", "impact", "between", "overview", "diff", "analyze"]},
+        {"name": "Explore", "commands": ["about", "usages", "impact", "between", "overview", "diff", "analyze", "context", "blame"]},
         {"name": "Enforce", "commands": ["rule", "check"]},
         {"name": "Inspect", "commands": ["show", "list", "status", "query", "validate"]},
         {"name": "Mutate", "commands": ["init", "add", "link", "rm", "unlink", "update", "scan", "watch", "batch"]},

@@ -1,5 +1,5 @@
 """Tests for graph diffing."""
-from smg.diff import GraphDiff, diff_graphs
+from smg.diff import GraphDiff, RenamedNode, diff_graphs
 from smg.graph import SemGraph
 from smg.model import Edge, Node, NodeType, RelType
 
@@ -158,3 +158,125 @@ def test_diff_cli(tmp_path):
     data = json.loads(result.output)
     # No baseline in git, so everything is "added"
     assert data["summary"]["nodes_added"] == 1
+
+
+def test_diff_rename_by_content_hash():
+    """Exact content match detects a pure rename."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo", type=NodeType.FUNCTION, file="app.py", line=1,
+                       metadata={"content_hash": "abcd1234abcd1234", "structure_hash": "efgh5678efgh5678"}))
+    new = SemGraph()
+    new.add_node(Node(name="app.bar", type=NodeType.FUNCTION, file="app.py", line=1,
+                       metadata={"content_hash": "abcd1234abcd1234", "structure_hash": "efgh5678efgh5678"}))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 1
+    assert result.renamed_nodes[0].old_name == "app.foo"
+    assert result.renamed_nodes[0].new_name == "app.bar"
+    assert result.renamed_nodes[0].match_type == "content"
+    assert len(result.added_nodes) == 0
+    assert len(result.removed_nodes) == 0
+
+
+def test_diff_rename_by_structure_hash():
+    """Structure match detects a rename with minor content changes."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo", type=NodeType.FUNCTION, file="app.py", line=1,
+                       metadata={"content_hash": "aaaa", "structure_hash": "same_struct_hash"}))
+    new = SemGraph()
+    new.add_node(Node(name="app.bar", type=NodeType.FUNCTION, file="app.py", line=1,
+                       metadata={"content_hash": "bbbb", "structure_hash": "same_struct_hash"}))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 1
+    assert result.renamed_nodes[0].match_type == "structure"
+    assert len(result.added_nodes) == 0
+    assert len(result.removed_nodes) == 0
+
+
+def test_diff_ambiguous_rename_skipped():
+    """Two removed nodes with same structure hash — ambiguous, no rename detected."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "aaaa", "structure_hash": "same"}))
+    old.add_node(Node(name="app.baz", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "cccc", "structure_hash": "same"}))
+    new = SemGraph()
+    new.add_node(Node(name="app.bar", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "bbbb", "structure_hash": "same"}))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 0
+    assert len(result.added_nodes) == 1
+    assert len(result.removed_nodes) == 2
+
+
+def test_diff_no_hashes_no_renames():
+    """Nodes without hashes fall through to normal add/remove."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo", type=NodeType.FUNCTION))
+    new = SemGraph()
+    new.add_node(Node(name="app.bar", type=NodeType.FUNCTION))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 0
+    assert len(result.added_nodes) == 1
+    assert len(result.removed_nodes) == 1
+
+
+def test_diff_rename_disabled():
+    """detect_renames=False skips rename detection."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "same", "structure_hash": "same"}))
+    new = SemGraph()
+    new.add_node(Node(name="app.bar", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "same", "structure_hash": "same"}))
+
+    result = diff_graphs(old, new, detect_renames=False)
+    assert len(result.renamed_nodes) == 0
+    assert len(result.added_nodes) == 1
+    assert len(result.removed_nodes) == 1
+
+
+def test_diff_fuzzy_rename():
+    """Phase 3: fuzzy Jaccard match on names with high token overlap (>= 0.8)."""
+    old = SemGraph()
+    # 4 tokens: app, utils, parse, config
+    old.add_node(Node(name="app.utils.parse_config", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "aaaa", "structure_hash": "xxxx"}))
+    new = SemGraph()
+    # 5 tokens: app, utils, helpers, parse, config — intersection=4, union=5, J=0.8
+    new.add_node(Node(name="app.utils.helpers.parse_config", type=NodeType.FUNCTION,
+                       metadata={"content_hash": "bbbb", "structure_hash": "yyyy"}))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 1
+    assert result.renamed_nodes[0].match_type == "fuzzy"
+    assert result.renamed_nodes[0].old_name == "app.utils.parse_config"
+    assert result.renamed_nodes[0].new_name == "app.utils.helpers.parse_config"
+
+
+def test_diff_fuzzy_no_match_different_type():
+    """Phase 3: fuzzy matching only considers same-type entities."""
+    old = SemGraph()
+    old.add_node(Node(name="app.foo.bar", type=NodeType.FUNCTION))
+    new = SemGraph()
+    new.add_node(Node(name="app.foo.bar", type=NodeType.CLASS))
+
+    result = diff_graphs(old, new)
+    # Same name but different type — shows as changed, not renamed
+    assert len(result.renamed_nodes) == 0
+
+
+def test_diff_fuzzy_no_match_low_similarity():
+    """Phase 3: low similarity names don't match."""
+    old = SemGraph()
+    old.add_node(Node(name="app.alpha.beta", type=NodeType.FUNCTION))
+    new = SemGraph()
+    new.add_node(Node(name="lib.gamma.delta", type=NodeType.FUNCTION))
+
+    result = diff_graphs(old, new)
+    assert len(result.renamed_nodes) == 0
+    assert len(result.added_nodes) == 1
+    assert len(result.removed_nodes) == 1

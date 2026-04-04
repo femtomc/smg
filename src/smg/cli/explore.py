@@ -392,12 +392,17 @@ def diff(ref: str, fmt: str | None) -> None:
                 {"name": node.name, "changes": [{"field": c.field, "old": c.old, "new": c.new} for c in changes]}
                 for node, changes in result.changed_nodes
             ],
+            "renamed_nodes": [
+                {"old_name": rn.old_name, "new_name": rn.new_name, "match_type": rn.match_type}
+                for rn in result.renamed_nodes
+            ],
             "added_edges": [{"source": e.source, "rel": e.rel.value, "target": e.target} for e in result.added_edges],
             "removed_edges": [{"source": e.source, "rel": e.rel.value, "target": e.target} for e in result.removed_edges],
             "summary": {
                 "nodes_added": len(result.added_nodes),
                 "nodes_removed": len(result.removed_nodes),
                 "nodes_changed": len(result.changed_nodes),
+                "nodes_renamed": len(result.renamed_nodes),
                 "edges_added": len(result.added_edges),
                 "edges_removed": len(result.removed_edges),
             },
@@ -428,6 +433,12 @@ def diff(ref: str, fmt: str | None) -> None:
             for c in changes:
                 console.print(f"      {c.field}: [red]{c.old}[/] → [green]{c.new}[/]")
 
+    if result.renamed_nodes:
+        console.print(f"[blue]~[/] [bold]{len(result.renamed_nodes)} node(s) renamed/moved[/]")
+        for rn in result.renamed_nodes:
+            tag = "exact" if rn.match_type == "content" else "structural"
+            console.print(f"  [blue]~[/] {rn.old_name} → {rn.new_name} [dim]({tag} match)[/]")
+
     if result.added_edges:
         console.print(f"[green]+[/] [bold]{len(result.added_edges)} edge(s) added[/]")
         for e in result.added_edges[:20]:
@@ -450,6 +461,8 @@ def diff(ref: str, fmt: str | None) -> None:
         parts.append(f"[red]-{len(result.removed_nodes)}[/]")
     if result.changed_nodes:
         parts.append(f"[yellow]~{len(result.changed_nodes)}[/]")
+    if result.renamed_nodes:
+        parts.append(f"[blue]↷{len(result.renamed_nodes)}[/]")
     console.print(f"\n[dim]Nodes: {', '.join(parts)} | Edges: +{len(result.added_edges)} -{len(result.removed_edges)}[/]")
 
 
@@ -458,8 +471,9 @@ def diff(ref: str, fmt: str | None) -> None:
 @click.option("--module", "module_filter", default=None, help="Scope analysis to nodes under this module/package prefix")
 @click.option("--since", "since_ref", default=None, help="Only analyze nodes/edges added or changed since a git ref (e.g. HEAD~5)")
 @click.option("--summary", is_flag=True, help="Show only hotspots and key findings, skip full listings")
+@click.option("--churn-days", default=90, type=int, help="Time window for git churn analysis [dim](default: 90 days)[/]")
 @click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
-def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summary: bool, fmt: str | None) -> None:
+def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summary: bool, churn_days: int, fmt: str | None) -> None:
     """Deep architectural analysis with hotspot detection.
 
     \b
@@ -559,6 +573,15 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     _step("Detecting god files...")
     god_files = graph_metrics.god_files(graph)
 
+    # Git churn
+    _step("Computing git churn...")
+    churn_data = None
+    try:
+        from smg.churn import compute_churn
+        churn_data = compute_churn(graph, _root, days=churn_days)
+    except Exception:
+        pass  # git not available or not a git repo
+
     max_cc_data: dict[str, int] = {}
     fio: dict[str, dict[str, int]] = {}
     hits_data: dict[str, dict[str, float]] = {}
@@ -613,6 +636,11 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         if p > 0.02:
             score += p * 50
             reasons.append(f"high importance (PR={p:.4f})")
+        if churn_data:
+            churn_count = churn_data.entity_churn.get(name, 0)
+            if churn_count > 10:
+                score += churn_count / 5
+                reasons.append(f"high churn ({churn_count} touches)")
         if reasons:
             hotspots.append({"name": name, "type": "class", "score": round(score, 2), "reasons": reasons})
 
@@ -623,6 +651,27 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
                 "name": name, "type": "module", "score": round(m["distance"] * 5, 2),
                 "reasons": [f"far from main sequence (D={m['distance']}, I={m['instability']}, A={m['abstractness']})"],
             })
+
+    # Function-level churn hotspots (high churn + high complexity)
+    if churn_data:
+        hotspot_names = {h["name"] for h in hotspots}
+        for name, touches in churn_data.entity_churn.items():
+            if name in hotspot_names:
+                continue
+            node = graph.get_node(name)
+            if node is None or node.type.value not in ("function", "method"):
+                continue
+            cc = node.metadata.get("metrics", {}).get("cyclomatic_complexity", 1)
+            score = 0.0
+            reasons: list[str] = []
+            if touches > 5:
+                score += touches / 5
+                reasons.append(f"high churn ({touches} touches)")
+            if cc > 10:
+                score += cc / 5
+                reasons.append(f"high complexity (CC={cc})")
+            if score > 2.0:
+                hotspots.append({"name": name, "type": node.type.value, "score": round(score, 2), "reasons": reasons})
 
     hotspots.sort(key=lambda h: h["score"], reverse=True)
 
@@ -675,6 +724,19 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
             "shotgun_surgery": shotgun,
             "god_files": god_files,
         }
+        if churn_data:
+            data["churn"] = {
+                "total_commits": churn_data.total_commits,
+                "time_range": churn_data.time_range,
+                "top_entities": sorted(
+                    [{"name": n, "touches": t} for n, t in churn_data.entity_churn.items()],
+                    key=lambda x: x["touches"], reverse=True,
+                )[:top_n],
+                "top_files": sorted(
+                    [{"file": f, "touches": t} for f, t in churn_data.file_churn.items()],
+                    key=lambda x: x["touches"], reverse=True,
+                )[:top_n],
+            }
         if not summary:
             fio_top = sorted(fio.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)[:top_n]
             data["fan_in_out"] = [{"name": n, **v} for n, v in fio_top]
@@ -767,6 +829,18 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
             console.print(f"  [red]Shotgun Surgery:[/] {ss['name']} [dim](fan-out={ss['fan_out']})[/]")
         for gf in god_files[:3]:
             console.print(f"  [red]God File:[/] {gf['file']} [dim]({'; '.join(gf['reasons'])})[/]")
+
+    # Git churn
+    if churn_data and churn_data.entity_churn:
+        console.print(f"\n[bold]Git Churn[/] ({churn_data.time_range}, {churn_data.total_commits} commits)")
+        churn_top = sorted(churn_data.entity_churn.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        churn_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        churn_table.add_column("#", style="dim", width=3)
+        churn_table.add_column("Entity", style="bold")
+        churn_table.add_column("Touches", justify="right")
+        for i, (cname, touches) in enumerate(churn_top, 1):
+            churn_table.add_row(str(i), cname, str(touches))
+        console.print(churn_table)
 
     if summary:
         # Summary mode: just hotspots + cycles + violations, done
@@ -889,3 +963,154 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
                 role = "both"
             hits_table.add_row(name, f"{scores['hub']:.4f}", f"{scores['authority']:.4f}", role)
         console.print(hits_table)
+
+
+@main.command()
+@click.argument("name")
+@click.option("--tokens", default=4000, type=int, help="Token budget [dim](default: 4000)[/]")
+@click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
+def context(name: str, tokens: int, fmt: str | None) -> None:
+    """Pack relevant source code for LLM context within a token budget.
+
+    Walks outward from the target entity, greedily packing source code by
+    graph proximity. Degrades from full source to signatures to summaries
+    as the budget fills up.
+
+    \b
+    Examples:
+      smg context SemGraph --tokens 8000
+      smg context add_node --tokens 2000
+      smg context SemGraph | pbcopy           # pipe JSON to clipboard
+    """
+    import json as json_mod
+    from pathlib import Path
+
+    from smg.context import build_context
+
+    graph, root = _load()
+    name = _resolve_or_exit(graph, name)
+    fmt = _auto_fmt(fmt)
+
+    result = build_context(graph, root, name, budget=tokens)
+
+    if fmt == "json":
+        data = {
+            "target": result.target,
+            "total_tokens": result.total_tokens,
+            "budget": result.budget,
+            "truncated": result.truncated,
+            "entries": [
+                {
+                    "name": e.name, "type": e.node_type, "relation": e.relation,
+                    "level": e.level, "tokens": e.tokens, "content": e.content,
+                }
+                for e in result.entries
+            ],
+        }
+        click.echo(json_mod.dumps(data, indent=2))
+        return
+
+    console.print(f"[bold]Context for[/] {result.target} [dim]({result.total_tokens}/{result.budget} tokens)[/]\n")
+
+    _level_badge = {"full": "[green]full[/]", "signature": "[yellow]sig[/]", "summary": "[dim]sum[/]"}
+
+    for entry in result.entries:
+        badge = _level_badge.get(entry.level, entry.level)
+        header = f"[bold]{entry.name}[/] [{_type_badge(entry.node_type)}] {badge} [dim]({entry.relation}, ~{entry.tokens} tok)[/]"
+
+        if entry.level in ("full", "signature") and entry.file:
+            from rich.syntax import Syntax
+            ext = Path(entry.file).suffix if entry.file else ".txt"
+            _lang_map = {".py": "python", ".js": "javascript", ".ts": "typescript", ".c": "c", ".cpp": "cpp", ".zig": "zig"}
+            lang = _lang_map.get(ext, "text")
+            console.print(header)
+            console.print(Syntax(entry.content, lang, line_numbers=True, start_line=entry.line or 1))
+            console.print()
+        else:
+            console.print(header)
+            console.print(f"  [dim]{entry.content}[/]\n")
+
+    if result.truncated:
+        console.print("[yellow]Budget exhausted[/] — some neighbors omitted or downgraded")
+
+
+@main.command()
+@click.argument("name")
+@click.option("--format", "fmt", default=None, type=click.Choice(["text", "json"]), help="Output format (auto-detects: JSON when piped)")
+def blame(name: str, fmt: str | None) -> None:
+    """Who last touched this entity? Entity-level git blame.
+
+    Accepts a node name or a file path. If a node name is given, blames that
+    single entity. If a file path is given, blames all entities in that file.
+
+    \b
+    Examples:
+      smg blame SemGraph              # single entity
+      smg blame src/smg/graph.py      # all entities in file
+    """
+    import json as json_mod
+
+    from smg.blame import blame_entity, blame_file
+
+    graph, root = _load()
+    fmt = _auto_fmt(fmt)
+
+    # Check if the argument is a file path
+    is_file = "/" in name or name.endswith(".py") or name.endswith(".js") or name.endswith(".ts") or name.endswith(".c") or name.endswith(".zig")
+
+    if is_file:
+        entries = blame_file(graph, name, root)
+        if not entries:
+            err_console.print(f"[red]Error:[/] no entities found in [bold]{name}[/]")
+            sys.exit(EXIT_NOT_FOUND)
+
+        if fmt == "json":
+            data = [
+                {"name": e.name, "type": e.node_type, "file": e.file,
+                 "line": e.line, "end_line": e.end_line,
+                 "commit": e.commit, "author": e.author, "date": e.date, "summary": e.summary}
+                for e in entries
+            ]
+            click.echo(json_mod.dumps(data, indent=2))
+            return
+
+        console.print(f"[bold]Blame for[/] {name}\n")
+        table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        table.add_column("Lines", style="dim", width=10)
+        table.add_column("Entity", style="bold")
+        table.add_column("Type")
+        table.add_column("Commit", style="dim", width=12)
+        table.add_column("Author")
+        table.add_column("Date", style="dim")
+        table.add_column("Summary")
+        for e in entries:
+            table.add_row(
+                f"{e.line}-{e.end_line}", e.name, _type_badge(e.node_type),
+                e.commit, e.author, e.date, e.summary,
+            )
+        console.print(table)
+    else:
+        resolved = _resolve_or_exit(graph, name)
+        node = graph.get_node(resolved)
+        if node is None:
+            err_console.print(f"[red]Error:[/] node not found: [bold]{name}[/]")
+            sys.exit(EXIT_NOT_FOUND)
+
+        entry = blame_entity(node, root)
+        if entry is None:
+            err_console.print(f"[yellow]Warning:[/] no git blame data for [bold]{resolved}[/] (no file/line or not in git)")
+            sys.exit(EXIT_NOT_FOUND)
+
+        if fmt == "json":
+            data = {
+                "name": entry.name, "type": entry.node_type, "file": entry.file,
+                "line": entry.line, "end_line": entry.end_line,
+                "commit": entry.commit, "author": entry.author, "date": entry.date, "summary": entry.summary,
+            }
+            click.echo(json_mod.dumps(data, indent=2))
+            return
+
+        console.print(f"[bold]{entry.name}[/] [{_type_badge(entry.node_type)}]")
+        console.print(f"  [dim]{entry.file}:{entry.line}-{entry.end_line}[/]")
+        console.print(f"  [bold]{entry.commit}[/] {entry.author} [dim]({entry.date})[/]")
+        console.print(f"  {entry.summary}")

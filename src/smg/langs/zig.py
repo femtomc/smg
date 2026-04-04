@@ -4,6 +4,7 @@ from __future__ import annotations
 import tree_sitter_zig as tszig
 from tree_sitter import Language, Node as TSNode, Parser
 
+from smg.hashing import content_hash, structure_hash
 from smg.langs import ExtractResult, register
 from smg.metrics import BranchMap, compute_metrics
 from smg.model import Edge, Node, NodeType, RelType
@@ -42,13 +43,14 @@ class ZigExtractor:
         tree = _PARSER.parse(source)
         nodes: list[Node] = []
         edges: list[Edge] = []
-        self._walk_top_level(tree.root_node, module_name, file_path, nodes, edges)
+        self._walk_top_level(tree.root_node, source, module_name, file_path, nodes, edges)
         self._extract_imports(tree.root_node, module_name, edges)
         return ExtractResult(nodes=nodes, edges=edges)
 
     def _walk_top_level(
         self,
         root: TSNode,
+        source: bytes,
         module_name: str,
         file_path: str,
         nodes: list[Node],
@@ -56,15 +58,16 @@ class ZigExtractor:
     ) -> None:
         for child in root.children:
             if child.type == "variable_declaration":
-                self._extract_variable_decl(child, module_name, file_path, nodes, edges)
+                self._extract_variable_decl(child, source, module_name, file_path, nodes, edges)
             elif child.type == "function_declaration":
-                self._extract_function(child, module_name, None, file_path, nodes, edges)
+                self._extract_function(child, source, module_name, None, file_path, nodes, edges)
             elif child.type == "test_declaration":
                 self._extract_test(child, module_name, file_path, nodes, edges)
 
     def _extract_variable_decl(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -78,7 +81,7 @@ class ZigExtractor:
         # Check if it's a struct declaration
         struct_node = _find_child(node, "struct_declaration")
         if struct_node is not None:
-            self._extract_struct(struct_node, var_name, parent_name, file_path, nodes, edges)
+            self._extract_struct(struct_node, source, var_name, parent_name, file_path, nodes, edges)
             return
 
         # Check if it's an enum or union
@@ -98,6 +101,7 @@ class ZigExtractor:
     def _extract_struct(
         self,
         struct_node: TSNode,
+        source: bytes,
         struct_name: str,
         parent_name: str,
         file_path: str,
@@ -111,19 +115,24 @@ class ZigExtractor:
             file=file_path,
             line=struct_node.start_point[0] + 1,
             end_line=struct_node.end_point[0] + 1,
+            metadata={
+                "content_hash": content_hash(source, struct_node.start_byte, struct_node.end_byte),
+                "structure_hash": structure_hash(struct_node),
+            },
         ))
         edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
         # Walk struct body for methods and fields
         for child in struct_node.children:
             if child.type == "function_declaration":
-                self._extract_function(child, qualified, qualified, file_path, nodes, edges)
+                self._extract_function(child, source, qualified, qualified, file_path, nodes, edges)
             elif child.type == "variable_declaration":
-                self._extract_variable_decl(child, qualified, file_path, nodes, edges)
+                self._extract_variable_decl(child, source, qualified, file_path, nodes, edges)
 
     def _extract_function(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         struct_name: str | None,
         file_path: str,
@@ -147,7 +156,11 @@ class ZigExtractor:
             file=file_path,
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
-            metadata={"metrics": metrics.to_dict()},
+            metadata={
+                "metrics": metrics.to_dict(),
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 

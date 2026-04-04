@@ -3,6 +3,7 @@ from __future__ import annotations
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node as TSNode, Parser
 
+from smg.hashing import content_hash, structure_hash
 from smg.langs import ExtractResult, register
 from smg.metrics import PYTHON_BRANCH_MAP, compute_metrics
 from smg.model import Edge, Node, NodeType, RelType
@@ -33,13 +34,14 @@ class PythonExtractor:
         tree = _PARSER.parse(source)
         nodes: list[Node] = []
         edges: list[Edge] = []
-        self._walk_body(tree.root_node, module_name, file_path, nodes, edges)
+        self._walk_body(tree.root_node, source, module_name, file_path, nodes, edges)
         self._extract_imports(tree.root_node, module_name, edges)
         return ExtractResult(nodes=nodes, edges=edges)
 
     def _walk_body(
         self,
         body_node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -48,23 +50,24 @@ class PythonExtractor:
         """Walk children of a block/module, extracting classes, functions, and assignments."""
         for child in body_node.children:
             if child.type == "class_definition":
-                self._extract_class(child, parent_name, file_path, nodes, edges)
+                self._extract_class(child, source, parent_name, file_path, nodes, edges)
             elif child.type == "function_definition":
-                self._extract_function(child, parent_name, file_path, nodes, edges)
+                self._extract_function(child, source, parent_name, file_path, nodes, edges)
             elif child.type == "decorated_definition":
                 # Unwrap to the inner definition
                 decorators = [c for c in child.children if c.type == "decorator"]
                 inner = child.child_by_field_name("definition")
                 if inner is not None and inner.type == "class_definition":
-                    self._extract_class(inner, parent_name, file_path, nodes, edges, decorators)
+                    self._extract_class(inner, source, parent_name, file_path, nodes, edges, decorators)
                 elif inner is not None and inner.type == "function_definition":
-                    self._extract_function(inner, parent_name, file_path, nodes, edges, decorators)
+                    self._extract_function(inner, source, parent_name, file_path, nodes, edges, decorators)
             elif child.type == "expression_statement":
                 self._extract_assignment(child, parent_name, file_path, nodes, edges)
 
     def _extract_class(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         out_nodes: list[Node],
@@ -84,6 +87,10 @@ class PythonExtractor:
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
             docstring=self._get_docstring(node),
+            metadata={
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
@@ -123,11 +130,12 @@ class PythonExtractor:
         # Walk class body for methods and nested classes
         body = node.child_by_field_name("body")
         if body is not None:
-            self._walk_body(body, qualified, file_path, out_nodes, out_edges)
+            self._walk_body(body, source, qualified, file_path, out_nodes, out_edges)
 
     def _extract_function(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         out_nodes: list[Node],
@@ -156,7 +164,11 @@ class PythonExtractor:
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
             docstring=self._get_docstring(node),
-            metadata={"metrics": metrics.to_dict()},
+            metadata={
+                "metrics": metrics.to_dict(),
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 

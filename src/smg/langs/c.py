@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from tree_sitter import Language, Node as TSNode, Parser
 
+from smg.hashing import content_hash, structure_hash
 from smg.langs import ExtractResult, register
 from smg.metrics import BranchMap, compute_metrics
 from smg.model import Edge, Node, NodeType, RelType
@@ -86,13 +87,14 @@ class _CExtractorBase:
         tree = parser.parse(source)
         nodes: list[Node] = []
         edges: list[Edge] = []
-        self._walk_top_level(tree.root_node, module_name, file_path, nodes, edges, is_cpp)
+        self._walk_top_level(tree.root_node, source, module_name, file_path, nodes, edges, is_cpp)
         self._extract_includes(tree.root_node, module_name, edges)
         return ExtractResult(nodes=nodes, edges=edges)
 
     def _walk_top_level(
         self,
         root: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -114,9 +116,9 @@ class _CExtractorBase:
                     stack.append((child, pname))
                     continue
                 if ctype == "function_definition":
-                    self._extract_function(child, pname, None, file_path, nodes, edges)
+                    self._extract_function(child, source, pname, None, file_path, nodes, edges)
                 elif ctype == "type_definition":
-                    self._extract_typedef(child, pname, file_path, nodes, edges)
+                    self._extract_typedef(child, source, pname, file_path, nodes, edges)
                 elif ctype == "preproc_def":
                     self._extract_define(child, pname, file_path, nodes, edges)
                 elif ctype == "declaration":
@@ -124,15 +126,16 @@ class _CExtractorBase:
                     if is_cpp:
                         for inner in child.children:
                             if inner.type in ("class_specifier", "struct_specifier"):
-                                self._extract_cpp_class(inner, pname, file_path, nodes, edges)
+                                self._extract_cpp_class(inner, source, pname, file_path, nodes, edges)
                 elif is_cpp and ctype == "namespace_definition":
-                    self._extract_namespace(child, pname, file_path, nodes, edges)
+                    self._extract_namespace(child, source, pname, file_path, nodes, edges)
                 elif is_cpp and ctype in ("class_specifier", "struct_specifier"):
-                    self._extract_cpp_class(child, pname, file_path, nodes, edges)
+                    self._extract_cpp_class(child, source, pname, file_path, nodes, edges)
 
     def _extract_namespace(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -149,11 +152,12 @@ class _CExtractorBase:
 
         body = _find_child(node, "declaration_list")
         if body is not None:
-            self._walk_top_level(body, qualified, file_path, nodes, edges, is_cpp=True)
+            self._walk_top_level(body, source, qualified, file_path, nodes, edges, is_cpp=True)
 
     def _extract_cpp_class(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -165,7 +169,14 @@ class _CExtractorBase:
         class_name = name_node.text.decode()
         qualified = f"{parent_name}.{class_name}"
 
-        nodes.append(Node(name=qualified, type=NodeType.CLASS, file=file_path, line=node.start_point[0] + 1, end_line=node.end_point[0] + 1))
+        nodes.append(Node(
+            name=qualified, type=NodeType.CLASS, file=file_path,
+            line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+            metadata={
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
+        ))
         edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
         # Inheritance
@@ -183,11 +194,12 @@ class _CExtractorBase:
         if body is not None:
             for child in body.children:
                 if child.type == "function_definition":
-                    self._extract_function(child, qualified, qualified, file_path, nodes, edges)
+                    self._extract_function(child, source, qualified, qualified, file_path, nodes, edges)
 
     def _extract_typedef(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -204,7 +216,14 @@ class _CExtractorBase:
         struct_name = name_node.text.decode()
         qualified = f"{parent_name}.{struct_name}"
 
-        nodes.append(Node(name=qualified, type=NodeType.CLASS, file=file_path, line=node.start_point[0] + 1, end_line=node.end_point[0] + 1))
+        nodes.append(Node(
+            name=qualified, type=NodeType.CLASS, file=file_path,
+            line=node.start_point[0] + 1, end_line=node.end_point[0] + 1,
+            metadata={
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
+        ))
         edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
     def _extract_define(
@@ -229,6 +248,7 @@ class _CExtractorBase:
     def _extract_function(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         class_name: str | None,
         file_path: str,
@@ -249,7 +269,11 @@ class _CExtractorBase:
             file=file_path,
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
-            metadata={"metrics": metrics.to_dict()},
+            metadata={
+                "metrics": metrics.to_dict(),
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 

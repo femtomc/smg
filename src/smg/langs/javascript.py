@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from tree_sitter import Language, Node as TSNode, Parser
 
+from smg.hashing import content_hash, structure_hash
 from smg.langs import ExtractResult, register
 from smg.metrics import JS_BRANCH_MAP, compute_metrics
 from smg.model import Edge, Node, NodeType, RelType
@@ -41,13 +42,14 @@ class _JSExtractorBase:
         tree = parser.parse(source)
         nodes: list[Node] = []
         edges: list[Edge] = []
-        self._walk_body(tree.root_node, module_name, file_path, nodes, edges)
+        self._walk_body(tree.root_node, source, module_name, file_path, nodes, edges)
         self._extract_imports(tree.root_node, module_name, edges)
         return ExtractResult(nodes=nodes, edges=edges)
 
     def _walk_body(
         self,
         body_node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         nodes: list[Node],
@@ -55,16 +57,16 @@ class _JSExtractorBase:
     ) -> None:
         for child in body_node.children:
             if child.type == "class_declaration":
-                self._extract_class(child, parent_name, file_path, nodes, edges)
+                self._extract_class(child, source, parent_name, file_path, nodes, edges)
             elif child.type == "function_declaration":
-                self._extract_function(child, parent_name, file_path, nodes, edges)
+                self._extract_function(child, source, parent_name, file_path, nodes, edges)
             elif child.type == "export_statement":
                 # Unwrap: export class X {}, export function f() {}, export default ...
                 for inner in child.children:
                     if inner.type == "class_declaration":
-                        self._extract_class(inner, parent_name, file_path, nodes, edges)
+                        self._extract_class(inner, source, parent_name, file_path, nodes, edges)
                     elif inner.type == "function_declaration":
-                        self._extract_function(inner, parent_name, file_path, nodes, edges)
+                        self._extract_function(inner, source, parent_name, file_path, nodes, edges)
                     elif inner.type == "lexical_declaration":
                         self._extract_const(inner, parent_name, file_path, nodes, edges)
             elif child.type == "lexical_declaration":
@@ -75,6 +77,7 @@ class _JSExtractorBase:
     def _extract_class(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         out_nodes: list[Node],
@@ -92,6 +95,10 @@ class _JSExtractorBase:
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
             docstring=self._get_jsdoc(node),
+            metadata={
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
@@ -123,11 +130,12 @@ class _JSExtractorBase:
         if body is not None:
             for child in body.children:
                 if child.type == "method_definition":
-                    self._extract_method(child, qualified, file_path, out_nodes, out_edges)
+                    self._extract_method(child, source, qualified, file_path, out_nodes, out_edges)
 
     def _extract_method(
         self,
         node: TSNode,
+        source: bytes,
         class_name: str,
         file_path: str,
         out_nodes: list[Node],
@@ -148,7 +156,11 @@ class _JSExtractorBase:
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
             docstring=self._get_jsdoc(node),
-            metadata={"metrics": metrics.to_dict()},
+            metadata={
+                "metrics": metrics.to_dict(),
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         out_edges.append(Edge(source=class_name, target=qualified, rel=RelType.CONTAINS))
 
@@ -160,6 +172,7 @@ class _JSExtractorBase:
     def _extract_function(
         self,
         node: TSNode,
+        source: bytes,
         parent_name: str,
         file_path: str,
         out_nodes: list[Node],
@@ -180,7 +193,11 @@ class _JSExtractorBase:
             line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
             docstring=self._get_jsdoc(node),
-            metadata={"metrics": metrics.to_dict()},
+            metadata={
+                "metrics": metrics.to_dict(),
+                "content_hash": content_hash(source, node.start_byte, node.end_byte),
+                "structure_hash": structure_hash(node),
+            },
         ))
         out_edges.append(Edge(source=parent_name, target=qualified, rel=RelType.CONTAINS))
 
