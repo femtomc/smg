@@ -495,18 +495,15 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     kcore (with members), classes, modules, sdp_violations,
     fan_in_out, dead_code, layering_violations, smells
     """
-    import json as json_mod
-
-    from smg import graph_metrics, oo_metrics
+    from smg.analyze import AnalysisResult, filter_to_delta, run_analysis
 
     graph, _root = _load()
     fmt = _auto_fmt(fmt)
 
-    # Scope to a module prefix if requested
     if module_filter:
         graph = _scope_graph(graph, module_filter, fmt)
 
-    # Scope to nodes/edges that changed since a git ref
+    # Compute delta names for --since filtering
     delta_names: set[str] | None = None
     if since_ref:
         from smg.diff import diff_graphs, load_graph_from_git
@@ -514,242 +511,117 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         if old_graph is None:
             old_graph = SemGraph()
         diff_result = diff_graphs(old_graph, graph)
-        # Collect names of added/changed nodes
         delta_names = set()
         for n in diff_result.added_nodes:
             delta_names.add(n.name)
         for n, _changes in diff_result.changed_nodes:
             delta_names.add(n.name)
-        # Also include endpoints of added edges
         for e in diff_result.added_edges:
             delta_names.add(e.source)
             delta_names.add(e.target)
 
+    # Progress spinner
     use_progress = fmt == "text" and sys.stdout.isatty()
+    progress_ctx = None
     if use_progress:
         from rich.progress import Progress, SpinnerColumn, TextColumn
-        progress = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"), console=console, transient=True)
-        progress.start()
-        task_id = progress.add_task("Analyzing...")
+        progress_ctx = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"), console=console, transient=True)
+        progress_ctx.start()
+        task_id = progress_ctx.add_task("Analyzing...")
 
-    def _step(desc: str):
-        if use_progress:
-            progress.update(task_id, description=desc)
+    def _step(desc: str) -> None:
+        if progress_ctx is not None:
+            progress_ctx.update(task_id, description=desc)
 
-    # Graph-theoretic
-    _step("Finding cycles...")
-    cycles = graph_metrics.find_cycles(graph)
-    _step("Computing layers...")
-    layers = graph_metrics.topological_layers(graph)
-    _step("Computing PageRank...")
-    pr = graph_metrics.pagerank(graph)
-    _step("Computing betweenness centrality...")
-    bc = graph_metrics.betweenness_centrality(graph)
-    _step("Computing k-core decomposition...")
-    kc = graph_metrics.kcore_decomposition(graph)
-    _step("Detecting bridges...")
-    bridges = graph_metrics.detect_bridges(graph)
+    # Run analysis
+    r = run_analysis(graph, root=_root, churn_days=churn_days, full=not summary, on_step=_step)
 
-    # OO metrics
-    _step("Computing class metrics (CK suite)...")
-    wmc_data = oo_metrics.wmc(graph)
-    dit_data = oo_metrics.dit(graph)
-    noc_data = oo_metrics.noc(graph)
-    cbo_data = oo_metrics.cbo(graph)
-    rfc_data = oo_metrics.rfc(graph)
-    lcom_data = oo_metrics.lcom4(graph)
-    _step("Computing module metrics (Martin)...")
-    martin_data = oo_metrics.martin_metrics(graph)
-    _step("Checking SDP violations...")
-    sdp = oo_metrics.sdp_violations(graph)
-    _step("Detecting dead code...")
-    dead = graph_metrics.dead_code(graph)
-    _step("Checking layering violations...")
-    layer_violations = graph_metrics.layering_violations(graph)
-    _step("Detecting code smells...")
-    gods = oo_metrics.god_classes(graph)
-    envy = oo_metrics.feature_envy(graph)
-    shotgun = oo_metrics.shotgun_surgery(graph)
-    _step("Detecting god files...")
-    god_files = graph_metrics.god_files(graph)
+    if progress_ctx is not None:
+        progress_ctx.stop()
 
-    # Git churn
-    _step("Computing git churn...")
-    churn_data = None
-    try:
-        from smg.churn import compute_churn
-        churn_data = compute_churn(graph, _root, days=churn_days)
-    except Exception:
-        pass  # git not available or not a git repo
-
-    max_cc_data: dict[str, int] = {}
-    fio: dict[str, dict[str, int]] = {}
-    hits_data: dict[str, dict[str, float]] = {}
-    if not summary:
-        _step("Computing max method complexity...")
-        max_cc_data = oo_metrics.max_method_cc(graph)
-        _step("Computing fan-in/fan-out...")
-        fio = graph_metrics.fan_in_out(graph)
-        _step("Computing HITS (hub/authority)...")
-        hits_data = graph_metrics.hits(graph)
-
-    _step("Computing hotspots...")
-
-    if use_progress:
-        progress.stop()
-
-    # Summaries
-    max_layer = max(layers.values()) if layers else 0
-    max_k = max(kc.values()) if kc else 0
-    core_members = sorted(n for n, k in kc.items() if k == max_k) if kc else []
-    pr_top = sorted(pr.items(), key=lambda x: x[1], reverse=True)[:top_n]
-    bc_top = sorted(bc.items(), key=lambda x: x[1], reverse=True)[:top_n]
-
-    # --- Hotspot synthesis ---
-    # Composite score: normalize and combine PageRank, betweenness, WMC, CBO, LCOM4
-    hotspots: list[dict] = []
-    # Collect class-level hotspots
-    for name in wmc_data:
-        score = 0.0
-        reasons: list[str] = []
-        w = wmc_data.get(name, 0)
-        c = cbo_data.get(name, 0)
-        l = lcom_data.get(name, 0)
-        r = rfc_data.get(name, 0)
-        b = bc.get(name, 0.0)
-        p = pr.get(name, 0.0)
-        if w > 20:
-            score += w / 10
-            reasons.append(f"high complexity (WMC={w})")
-        if c > 5:
-            score += c
-            reasons.append(f"high coupling (CBO={c})")
-        if l > 1:
-            score += l * 3
-            reasons.append(f"low cohesion (LCOM4={l})")
-        if r > 20:
-            score += r / 5
-            reasons.append(f"large response set (RFC={r})")
-        if b > 0.05:
-            score += b * 20
-            reasons.append(f"structural bottleneck (BC={b:.3f})")
-        if p > 0.02:
-            score += p * 50
-            reasons.append(f"high importance (PR={p:.4f})")
-        if churn_data:
-            churn_count = churn_data.entity_churn.get(name, 0)
-            if churn_count > 10:
-                score += churn_count / 5
-                reasons.append(f"high churn ({churn_count} touches)")
-        if reasons:
-            hotspots.append({"name": name, "type": "class", "score": round(score, 2), "reasons": reasons})
-
-    # Collect module-level hotspots (high distance from main sequence)
-    for name, m in martin_data.items():
-        if m["distance"] > 0.7:
-            hotspots.append({
-                "name": name, "type": "module", "score": round(m["distance"] * 5, 2),
-                "reasons": [f"far from main sequence (D={m['distance']}, I={m['instability']}, A={m['abstractness']})"],
-            })
-
-    # Function-level churn hotspots (high churn + high complexity)
-    if churn_data:
-        hotspot_names = {h["name"] for h in hotspots}
-        for name, touches in churn_data.entity_churn.items():
-            if name in hotspot_names:
-                continue
-            node = graph.get_node(name)
-            if node is None or node.type.value not in ("function", "method"):
-                continue
-            cc = node.metadata.get("metrics", {}).get("cyclomatic_complexity", 1)
-            score = 0.0
-            reasons: list[str] = []
-            if touches > 5:
-                score += touches / 5
-                reasons.append(f"high churn ({touches} touches)")
-            if cc > 10:
-                score += cc / 5
-                reasons.append(f"high complexity (CC={cc})")
-            if score > 2.0:
-                hotspots.append({"name": name, "type": node.type.value, "score": round(score, 2), "reasons": reasons})
-
-    hotspots.sort(key=lambda h: h["score"], reverse=True)
-
-    # If --since was used, filter results to only delta nodes
     if delta_names is not None:
-        hotspots = [h for h in hotspots if h["name"] in delta_names]
-        dead = [n for n in dead if n in delta_names]
-        layer_violations = [v for v in layer_violations if v["source"] in delta_names or v["target"] in delta_names]
-        gods = [g for g in gods if g["name"] in delta_names]
-        envy = [e for e in envy if e["method"] in delta_names]
-        shotgun = [s for s in shotgun if s["name"] in delta_names]
-        # god_files: keep if any delta node lives in that file
-        node_files = {node.name: node.file for node in graph.iter_nodes() if node.file}
-        delta_files = {node_files[n] for n in delta_names if n in node_files}
-        god_files = [gf for gf in god_files if gf["file"] in delta_files]
+        filter_to_delta(r, delta_names, graph)
 
     if fmt == "json":
-        data: dict = {
-            "hotspots": hotspots[:top_n],
-            "graph": {
-                "nodes": len(graph),
-                "edges": len(graph.all_edges()),
-                "cycles": cycles,
-                "cycle_count": len(cycles),
-                "max_layer": max_layer,
-                "bridge_count": len(bridges),
-                "bridges": [list(b) for b in bridges[:top_n]],
-            },
-            "pagerank": [{"name": n, "rank": round(r, 6)} for n, r in pr_top],
-            "betweenness": [{"name": n, "centrality": round(c, 6)} for n, c in bc_top],
-            "kcore": {"max_coreness": max_k, "core_size": len(core_members), "members": core_members[:top_n]},
-        }
-        if not summary:
-            data["classes"] = {
-                name: {
-                    "wmc": wmc_data.get(name, 0), "max_method_cc": max_cc_data.get(name, 0),
-                    "dit": dit_data.get(name, 0), "noc": noc_data.get(name, 0),
-                    "cbo": cbo_data.get(name, 0), "rfc": rfc_data.get(name, 0),
-                    "lcom4": lcom_data.get(name, 0),
-                }
-                for name in sorted(wmc_data.keys())
-            }
-            data["modules"] = martin_data
-        data["sdp_violations"] = sdp
-        data["dead_code"] = dead
-        data["layering_violations"] = layer_violations
-        data["smells"] = {
-            "god_classes": gods,
-            "feature_envy": envy,
-            "shotgun_surgery": shotgun,
-            "god_files": god_files,
-        }
-        if churn_data:
-            data["churn"] = {
-                "total_commits": churn_data.total_commits,
-                "time_range": churn_data.time_range,
-                "top_entities": sorted(
-                    [{"name": n, "touches": t} for n, t in churn_data.entity_churn.items()],
-                    key=lambda x: x["touches"], reverse=True,
-                )[:top_n],
-                "top_files": sorted(
-                    [{"file": f, "touches": t} for f, t in churn_data.file_churn.items()],
-                    key=lambda x: x["touches"], reverse=True,
-                )[:top_n],
-            }
-        if not summary:
-            fio_top = sorted(fio.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)[:top_n]
-            data["fan_in_out"] = [{"name": n, **v} for n, v in fio_top]
-            hits_hubs = sorted(hits_data.items(), key=lambda x: x[1]["hub"], reverse=True)[:top_n]
-            hits_auths = sorted(hits_data.items(), key=lambda x: x[1]["authority"], reverse=True)[:top_n]
-            data["hits"] = {
-                "top_hubs": [{"name": n, **v} for n, v in hits_hubs],
-                "top_authorities": [{"name": n, **v} for n, v in hits_auths],
-            }
-        click.echo(json_mod.dumps(data, indent=2))
-        return
+        _render_analyze_json(r, graph, top_n, summary)
+    else:
+        _render_analyze_text(r, graph, top_n, summary, module_filter, since_ref, delta_names)
 
-    # --- Rich text output ---
+
+def _render_analyze_json(r: "AnalysisResult", graph: SemGraph, top_n: int, summary: bool) -> None:
+    """Render analysis results as JSON."""
+    import json as json_mod
+
+    max_layer = max(r.layers.values()) if r.layers else 0
+    max_k = max(r.kcore.values()) if r.kcore else 0
+    core_members = sorted(n for n, k in r.kcore.items() if k == max_k) if r.kcore else []
+    pr_top = sorted(r.pagerank.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    bc_top = sorted(r.betweenness.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+    data: dict = {
+        "hotspots": r.hotspots[:top_n],
+        "graph": {
+            "nodes": r.node_count, "edges": r.edge_count,
+            "cycles": r.cycles, "cycle_count": len(r.cycles),
+            "max_layer": max_layer, "bridge_count": len(r.bridges),
+            "bridges": [list(b) for b in r.bridges[:top_n]],
+        },
+        "pagerank": [{"name": n, "rank": round(v, 6)} for n, v in pr_top],
+        "betweenness": [{"name": n, "centrality": round(v, 6)} for n, v in bc_top],
+        "kcore": {"max_coreness": max_k, "core_size": len(core_members), "members": core_members[:top_n]},
+    }
+    if not summary:
+        data["classes"] = {
+            name: {
+                "wmc": r.wmc.get(name, 0), "max_method_cc": r.max_method_cc.get(name, 0),
+                "dit": r.dit.get(name, 0), "noc": r.noc.get(name, 0),
+                "cbo": r.cbo.get(name, 0), "rfc": r.rfc.get(name, 0),
+                "lcom4": r.lcom4.get(name, 0),
+            }
+            for name in sorted(r.wmc.keys())
+        }
+        data["modules"] = r.martin
+    data["sdp_violations"] = r.sdp_violations
+    data["dead_code"] = r.dead_code
+    data["layering_violations"] = r.layering_violations
+    data["smells"] = {
+        "god_classes": r.god_classes, "feature_envy": r.feature_envy,
+        "shotgun_surgery": r.shotgun_surgery, "god_files": r.god_files,
+    }
+    if r.churn:
+        data["churn"] = {
+            "total_commits": r.churn.total_commits, "time_range": r.churn.time_range,
+            "top_entities": sorted(
+                [{"name": n, "touches": t} for n, t in r.churn.entity_churn.items()],
+                key=lambda x: x["touches"], reverse=True,
+            )[:top_n],
+            "top_files": sorted(
+                [{"file": f, "touches": t} for f, t in r.churn.file_churn.items()],
+                key=lambda x: x["touches"], reverse=True,
+            )[:top_n],
+        }
+    if not summary:
+        fio_top = sorted(r.fan_in_out.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)[:top_n]
+        data["fan_in_out"] = [{"name": n, **v} for n, v in fio_top]
+        hits_hubs = sorted(r.hits.items(), key=lambda x: x[1]["hub"], reverse=True)[:top_n]
+        hits_auths = sorted(r.hits.items(), key=lambda x: x[1]["authority"], reverse=True)[:top_n]
+        data["hits"] = {
+            "top_hubs": [{"name": n, **v} for n, v in hits_hubs],
+            "top_authorities": [{"name": n, **v} for n, v in hits_auths],
+        }
+    click.echo(json_mod.dumps(data, indent=2))
+
+
+def _render_analyze_text(
+    r: "AnalysisResult", graph: SemGraph, top_n: int, summary: bool,
+    module_filter: str | None, since_ref: str | None, delta_names: set[str] | None,
+) -> None:
+    """Render analysis results as rich text."""
+    max_layer = max(r.layers.values()) if r.layers else 0
+    max_k = max(r.kcore.values()) if r.kcore else 0
+    core_members = sorted(n for n, k in r.kcore.items() if k == max_k) if r.kcore else []
+    pr_top = sorted(r.pagerank.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    bc_top = sorted(r.betweenness.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
     scope_label = ""
     if module_filter:
@@ -757,36 +629,36 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
     if since_ref:
         n_delta = len(delta_names) if delta_names else 0
         scope_label += f" [dim](since {since_ref}, {n_delta} changed)[/]"
-    console.print(f"\n[bold]Analysis[/]{scope_label} -- {len(graph)} nodes, {len(graph.all_edges())} edges")
+    console.print(f"\n[bold]Analysis[/]{scope_label} -- {r.node_count} nodes, {r.edge_count} edges")
 
-    # Hotspots (always shown)
-    if hotspots:
+    # Hotspots
+    if r.hotspots:
         console.print(f"\n[red bold]Hotspots[/] (top problem areas)")
         hs_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
         hs_table.add_column("#", style="dim", width=3)
         hs_table.add_column("Name", style="bold")
         hs_table.add_column("Score", justify="right")
         hs_table.add_column("Issues")
-        for i, h in enumerate(hotspots[:top_n], 1):
+        for i, h in enumerate(r.hotspots[:top_n], 1):
             hs_table.add_row(str(i), h["name"], str(h["score"]), "; ".join(h["reasons"]))
         console.print(hs_table)
     else:
         console.print("\n[green]No hotspots detected[/]")
 
     # Cycles
-    if cycles:
-        console.print(f"\n[red bold]Circular Dependencies[/] ({len(cycles)} cycle(s))")
-        for cycle in cycles[:5]:
+    if r.cycles:
+        console.print(f"\n[red bold]Circular Dependencies[/] ({len(r.cycles)} cycle(s))")
+        for cycle in r.cycles[:5]:
             console.print(f"  [red]-[/] {' -> '.join(cycle)}")
-        if len(cycles) > 5:
-            console.print(f"  [dim]... and {len(cycles) - 5} more[/]")
+        if len(r.cycles) > 5:
+            console.print(f"  [dim]... and {len(r.cycles) - 5} more[/]")
     else:
         console.print("\n[green]No circular dependencies[/]")
 
     # SDP violations
-    if sdp:
-        console.print(f"\n[red bold]SDP Violations[/] ({len(sdp)})")
-        for v in sdp[:5]:
+    if r.sdp_violations:
+        console.print(f"\n[red bold]SDP Violations[/] ({len(r.sdp_violations)})")
+        for v in r.sdp_violations[:5]:
             console.print(
                 f"  [red]-[/] {v['source']} [dim](I={v['source_instability']})[/]"
                 f" depends on {v['target']} [dim](I={v['target_instability']})[/]"
@@ -795,45 +667,45 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         console.print(f"\n[green]No SDP violations[/]")
 
     # Dead code
-    if dead:
-        console.print(f"\n[yellow bold]Dead Code[/] ({len(dead)} unreferenced node(s))")
-        for name in dead[:top_n]:
+    if r.dead_code:
+        console.print(f"\n[yellow bold]Dead Code[/] ({len(r.dead_code)} unreferenced node(s))")
+        for name in r.dead_code[:top_n]:
             node = graph.get_node(name)
             type_label = node.type.value if node else "?"
             console.print(f"  [yellow]-[/] {name} [dim]({type_label})[/]")
-        if len(dead) > top_n:
-            console.print(f"  [dim]... and {len(dead) - top_n} more[/]")
+        if len(r.dead_code) > top_n:
+            console.print(f"  [dim]... and {len(r.dead_code) - top_n} more[/]")
     else:
         console.print("\n[green]No dead code detected[/]")
 
     # Layering violations
-    if layer_violations:
-        console.print(f"\n[yellow bold]Layering Violations[/] ({len(layer_violations)} back-dependency edge(s))")
-        for v in layer_violations[:top_n]:
+    if r.layering_violations:
+        console.print(f"\n[yellow bold]Layering Violations[/] ({len(r.layering_violations)} back-dependency edge(s))")
+        for v in r.layering_violations[:top_n]:
             console.print(
                 f"  [yellow]-[/] {v['source']} [dim](L{v['source_layer']})[/]"
                 f" --{v['rel']}--> {v['target']} [dim](L{v['target_layer']})[/]"
             )
-        if len(layer_violations) > top_n:
-            console.print(f"  [dim]... and {len(layer_violations) - top_n} more[/]")
+        if len(r.layering_violations) > top_n:
+            console.print(f"  [dim]... and {len(r.layering_violations) - top_n} more[/]")
 
     # Code smells
-    if gods or envy or shotgun or god_files:
-        smell_count = len(gods) + len(envy) + len(shotgun) + len(god_files)
-        console.print(f"\n[red bold]Code Smells[/] ({smell_count})")
-        for gc in gods[:3]:
+    smells = r.god_classes + r.feature_envy + r.shotgun_surgery + r.god_files
+    if smells:
+        console.print(f"\n[red bold]Code Smells[/] ({len(smells)})")
+        for gc in r.god_classes[:3]:
             console.print(f"  [red]God Class:[/] {gc['name']} [dim](WMC={gc['wmc']}, CBO={gc['cbo']}, LCOM4={gc['lcom4']})[/]")
-        for fe in envy[:3]:
+        for fe in r.feature_envy[:3]:
             console.print(f"  [red]Feature Envy:[/] {fe['method']} envies {fe['envied_class']} [dim]({fe['envied_refs']} refs vs {fe['own_refs']} own)[/]")
-        for ss in shotgun[:3]:
+        for ss in r.shotgun_surgery[:3]:
             console.print(f"  [red]Shotgun Surgery:[/] {ss['name']} [dim](fan-out={ss['fan_out']})[/]")
-        for gf in god_files[:3]:
+        for gf in r.god_files[:3]:
             console.print(f"  [red]God File:[/] {gf['file']} [dim]({'; '.join(gf['reasons'])})[/]")
 
     # Git churn
-    if churn_data and churn_data.entity_churn:
-        console.print(f"\n[bold]Git Churn[/] ({churn_data.time_range}, {churn_data.total_commits} commits)")
-        churn_top = sorted(churn_data.entity_churn.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    if r.churn and r.churn.entity_churn:
+        console.print(f"\n[bold]Git Churn[/] ({r.churn.time_range}, {r.churn.total_commits} commits)")
+        churn_top = sorted(r.churn.entity_churn.items(), key=lambda x: x[1], reverse=True)[:top_n]
         churn_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
         churn_table.add_column("#", style="dim", width=3)
         churn_table.add_column("Entity", style="bold")
@@ -843,15 +715,13 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         console.print(churn_table)
 
     if summary:
-        # Summary mode: just hotspots + cycles + violations, done
-        console.print(f"\n[dim]Architecture depth: {max_layer + 1} layers | Core: {len(core_members)} nodes (k={max_k}) | Bridges: {len(bridges)}[/]")
+        console.print(f"\n[dim]Architecture depth: {max_layer + 1} layers | Core: {len(core_members)} nodes (k={max_k}) | Bridges: {len(r.bridges)}[/]")
         return
 
-    # --- Full output below (non-summary) ---
+    # --- Full output ---
 
     console.print(f"\n[bold]Architecture Depth:[/] {max_layer + 1} layers")
 
-    # PageRank
     console.print(f"\n[bold]Most Important (PageRank)[/]")
     pr_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
     pr_table.add_column("#", style="dim", width=3)
@@ -861,7 +731,6 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         pr_table.add_row(str(i), name, f"{rank:.4f}")
     console.print(pr_table)
 
-    # Betweenness
     bc_nonzero = [(n, c) for n, c in bc_top if c > 0]
     if bc_nonzero:
         console.print(f"\n[bold]Structural Bottlenecks (Betweenness)[/]")
@@ -873,7 +742,6 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
             bc_table.add_row(str(i), name, f"{cent:.4f}")
         console.print(bc_table)
 
-    # K-core with members
     if core_members:
         console.print(f"\n[bold]Core Structure[/] (k={max_k}, {len(core_members)} nodes)")
         for n in core_members[:top_n]:
@@ -881,82 +749,56 @@ def analyze(top_n: int, module_filter: str | None, since_ref: str | None, summar
         if len(core_members) > top_n:
             console.print(f"  [dim]... and {len(core_members) - top_n} more[/]")
 
-    # Bridges
-    if bridges:
-        console.print(f"\n[yellow]Fragile Connections:[/] {len(bridges)} bridge edge(s)")
-        for a, b in bridges[:5]:
+    if r.bridges:
+        console.print(f"\n[yellow]Fragile Connections:[/] {len(r.bridges)} bridge edge(s)")
+        for a, b in r.bridges[:5]:
             console.print(f"  [yellow]-[/] {a} -- {b}")
 
-    # Class metrics
-    if wmc_data:
+    if r.wmc:
         console.print(f"\n[bold]Class Metrics (CK Suite)[/]")
         ck_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
         ck_table.add_column("Class", style="bold")
-        ck_table.add_column("WMC", justify="right")
-        ck_table.add_column("MaxCC", justify="right")
-        ck_table.add_column("CBO", justify="right")
-        ck_table.add_column("RFC", justify="right")
-        ck_table.add_column("LCOM4", justify="right")
-        ck_table.add_column("DIT", justify="right")
-        ck_table.add_column("NOC", justify="right")
-        for name in sorted(wmc_data.keys(), key=lambda n: wmc_data[n], reverse=True)[:top_n]:
-            lcom_val = lcom_data.get(name, 0)
+        for col in ("WMC", "MaxCC", "CBO", "RFC", "LCOM4", "DIT", "NOC"):
+            ck_table.add_column(col, justify="right")
+        for name in sorted(r.wmc.keys(), key=lambda n: r.wmc[n], reverse=True)[:top_n]:
+            lcom_val = r.lcom4.get(name, 0)
             lcom_str = f"[red]{lcom_val}[/]" if lcom_val > 1 else str(lcom_val)
             ck_table.add_row(
-                name,
-                str(wmc_data.get(name, 0)), str(max_cc_data.get(name, 0)),
-                str(cbo_data.get(name, 0)),
-                str(rfc_data.get(name, 0)), lcom_str,
-                str(dit_data.get(name, 0)), str(noc_data.get(name, 0)),
+                name, str(r.wmc.get(name, 0)), str(r.max_method_cc.get(name, 0)),
+                str(r.cbo.get(name, 0)), str(r.rfc.get(name, 0)), lcom_str,
+                str(r.dit.get(name, 0)), str(r.noc.get(name, 0)),
             )
         console.print(ck_table)
 
-    # Module metrics
-    if martin_data:
+    if r.martin:
         console.print(f"\n[bold]Module Metrics (Martin)[/]")
         mod_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
-        mod_table.add_column("Module", style="bold")
-        mod_table.add_column("Ca", justify="right")
-        mod_table.add_column("Ce", justify="right")
-        mod_table.add_column("I", justify="right")
-        mod_table.add_column("A", justify="right")
-        mod_table.add_column("D", justify="right")
-        for name in sorted(martin_data.keys()):
-            m = martin_data[name]
+        for col in ("Module", "Ca", "Ce", "I", "A", "D"):
+            mod_table.add_column(col, justify="right" if col != "Module" else "left", style="bold" if col == "Module" else None)
+        for name in sorted(r.martin.keys()):
+            m = r.martin[name]
             d_str = f"[red]{m['distance']}[/]" if m["distance"] > 0.7 else str(m["distance"])
-            mod_table.add_row(
-                name, str(m["ca"]), str(m["ce"]),
-                str(m["instability"]), str(m["abstractness"]), d_str,
-            )
+            mod_table.add_row(name, str(m["ca"]), str(m["ce"]), str(m["instability"]), str(m["abstractness"]), d_str)
         console.print(mod_table)
 
-    # Fan-in/Fan-out (top nodes by total coupling)
-    if fio:
+    if r.fan_in_out:
         console.print(f"\n[bold]Fan-In / Fan-Out (top {top_n})[/]")
         fio_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
-        fio_table.add_column("Name", style="bold")
-        fio_table.add_column("Fan-In", justify="right")
-        fio_table.add_column("Fan-Out", justify="right")
-        fio_table.add_column("Total", justify="right")
-        fio_sorted = sorted(fio.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)
+        for col in ("Name", "Fan-In", "Fan-Out", "Total"):
+            fio_table.add_column(col, justify="right" if col != "Name" else "left", style="bold" if col == "Name" else None)
+        fio_sorted = sorted(r.fan_in_out.items(), key=lambda x: x[1]["fan_in"] + x[1]["fan_out"], reverse=True)
         for name, vals in fio_sorted[:top_n]:
-            total = vals["fan_in"] + vals["fan_out"]
-            fio_table.add_row(name, str(vals["fan_in"]), str(vals["fan_out"]), str(total))
+            fio_table.add_row(name, str(vals["fan_in"]), str(vals["fan_out"]), str(vals["fan_in"] + vals["fan_out"]))
         console.print(fio_table)
 
-    # HITS (Hub/Authority)
-    if hits_data:
+    if r.hits:
         console.print(f"\n[bold]Hubs & Authorities (HITS, top {top_n})[/]")
         hits_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
         hits_table.add_column("Name", style="bold")
         hits_table.add_column("Hub", justify="right")
         hits_table.add_column("Authority", justify="right")
         hits_table.add_column("Role", justify="left")
-        hits_combined = sorted(
-            hits_data.items(),
-            key=lambda x: max(x[1]["hub"], x[1]["authority"]),
-            reverse=True,
-        )
+        hits_combined = sorted(r.hits.items(), key=lambda x: max(x[1]["hub"], x[1]["authority"]), reverse=True)
         for name, scores in hits_combined[:top_n]:
             role = "hub" if scores["hub"] > scores["authority"] else "authority"
             if scores["hub"] > 0.01 and scores["authority"] > 0.01:
