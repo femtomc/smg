@@ -90,6 +90,10 @@ fn initTypePtrs(lang: *ts.TSLanguage) void {
         if (ptrEql(name, "case_clause")) _case_clause = name;
         if (ptrEql(name, "boolean_operator")) _boolean_operator = name;
         if (ptrEql(name, "try_statement")) _try_statement = name;
+        if (ptrEql(name, "decorator")) _decorator = name;
+        if (ptrEql(name, "relative_import")) _relative_import = name;
+        if (ptrEql(name, "import_prefix")) _import_prefix = name;
+        if (ptrEql(name, "future_import_statement")) _future_import_statement = name;
     }
     _type_ptrs_init = true;
 }
@@ -416,7 +420,35 @@ const NameBuf = struct {
 
 // --- Entity output ---
 
-fn writeEntity(w: *JsonWriter, kind: []const u8, name: []const u8, file_path: []const u8, node: ts.TSNode, _: [*]const u8, m: ?Metrics, ch: u64, sh: u64) void {
+fn getDocstring(node: ts.TSNode, source: [*]const u8) ?[]const u8 {
+    const body = ts.ts_node_child_by_field_name(node, "body", 4);
+    if (ts.ts_node_is_null(body)) return null;
+    if (ts.ts_node_child_count(body) == 0) return null;
+    const first_stmt = ts.ts_node_child(body, 0);
+    if (!isExprStmt(ts.ts_node_type(first_stmt))) return null;
+    if (ts.ts_node_child_count(first_stmt) == 0) return null;
+    const expr = ts.ts_node_child(first_stmt, 0);
+    if (ts.ts_node_type(expr) != _string) return null;
+    // Find string_content child
+    const sc_count = ts.ts_node_child_count(expr);
+    for (0..sc_count) |i| {
+        const sc = ts.ts_node_child(expr, @intCast(i));
+        if (ts.ts_node_type(sc) == _string_content) {
+            return strip(nodeSlice(sc, source));
+        }
+    }
+    return null;
+}
+
+fn strip(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len and (s[start] == ' ' or s[start] == '\t' or s[start] == '\n' or s[start] == '\r')) : (start += 1) {}
+    var end: usize = s.len;
+    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t' or s[end - 1] == '\n' or s[end - 1] == '\r')) : (end -= 1) {}
+    return s[start..end];
+}
+
+fn writeEntity(w: *JsonWriter, kind: []const u8, name: []const u8, file_path: []const u8, node: ts.TSNode, source: [*]const u8, m: ?Metrics, ch: u64, sh: u64) void {
     var ch_hex: [16]u8 = undefined;
     var sh_hex: [16]u8 = undefined;
     writeHex64(ch, &ch_hex);
@@ -432,6 +464,13 @@ fn writeEntity(w: *JsonWriter, kind: []const u8, name: []const u8, file_path: []
     w.writeInt(@intCast(ts.ts_node_start_point(node).row + 1));
     w.write(",\"end_line\":");
     w.writeInt(@intCast(ts.ts_node_end_point(node).row + 1));
+    // Docstring
+    const doc = getDocstring(node, source);
+    if (doc) |d| {
+        w.write(",\"doc\":");
+        w.writeJsonString(d);
+    }
+
     w.write(",\"ch\":\"");
     w.write(&ch_hex);
     w.write("\",\"sh\":\"");
@@ -466,6 +505,40 @@ fn writeEdge(w: *JsonWriter, src: []const u8, rel: []const u8, tgt: []const u8, 
     w.write("}\n");
 }
 
+// --- Decorator helpers ---
+
+var _decorator: [*c]const u8 = undefined;
+var _relative_import: [*c]const u8 = undefined;
+var _import_prefix: [*c]const u8 = undefined;
+var _future_import_statement: [*c]const u8 = undefined;
+
+fn isDecorator(t: [*c]const u8) bool {
+    return t == _decorator;
+}
+
+fn getDecoratorName(dec_node: ts.TSNode, source: [*]const u8) ?[]const u8 {
+    const nc = ts.ts_node_child_count(dec_node);
+    for (0..nc) |i| {
+        const child = ts.ts_node_child(dec_node, @intCast(i));
+        const ct = ts.ts_node_type(child);
+        if (isIdentifier(ct)) return nodeSlice(child, source);
+        if (isAttribute(ct)) return nodeSlice(child, source);
+        if (isCall(ct)) {
+            const func = ts.ts_node_child_by_field_name(child, "function", 8);
+            if (!ts.ts_node_is_null(func)) return nodeSlice(func, source);
+        }
+    }
+    return null;
+}
+
+fn emitDecoratorEdges(decorators: []const ts.TSNode, target_name: []const u8, source: [*]const u8, w: *JsonWriter) void {
+    for (decorators) |dec| {
+        if (getDecoratorName(dec, source)) |dec_name| {
+            writeEdge(w, dec_name, "decorates", target_name, false);
+        }
+    }
+}
+
 // --- Extraction ---
 
 fn extractWalkBody(body_node: ts.TSNode, source: [*]const u8, parent_name: []const u8, file_path: []const u8, w: *JsonWriter) void {
@@ -475,15 +548,26 @@ fn extractWalkBody(body_node: ts.TSNode, source: [*]const u8, parent_name: []con
         const t = ts.ts_node_type(child);
 
         if (isFunctionDef(t)) {
-            extractFunction(child, source, parent_name, file_path, w);
+            extractFunction(child, source, parent_name, file_path, w, &.{});
         } else if (isClassDef(t)) {
-            extractClass(child, source, parent_name, file_path, w);
+            extractClass(child, source, parent_name, file_path, w, &.{});
         } else if (isDecoratedDef(t)) {
+            // Collect decorator children
+            var decs: [16]ts.TSNode = undefined;
+            var n_decs: usize = 0;
+            const dc = ts.ts_node_child_count(child);
+            for (0..dc) |di| {
+                const dchild = ts.ts_node_child(child, @intCast(di));
+                if (isDecorator(ts.ts_node_type(dchild)) and n_decs < 16) {
+                    decs[n_decs] = dchild;
+                    n_decs += 1;
+                }
+            }
             const defn = ts.ts_node_child_by_field_name(child, "definition", 10);
             if (!ts.ts_node_is_null(defn)) {
                 const dt = ts.ts_node_type(defn);
-                if (isFunctionDef(dt)) extractFunction(defn, source, parent_name, file_path, w);
-                if (isClassDef(dt)) extractClass(defn, source, parent_name, file_path, w);
+                if (isFunctionDef(dt)) extractFunction(defn, source, parent_name, file_path, w, decs[0..n_decs]);
+                if (isClassDef(dt)) extractClass(defn, source, parent_name, file_path, w, decs[0..n_decs]);
             }
         } else if (isExprStmt(t)) {
             extractAssignment(child, source, parent_name, file_path, w);
@@ -491,7 +575,7 @@ fn extractWalkBody(body_node: ts.TSNode, source: [*]const u8, parent_name: []con
     }
 }
 
-fn extractClass(node: ts.TSNode, source: [*]const u8, parent_name: []const u8, file_path: []const u8, w: *JsonWriter) void {
+fn extractClass(node: ts.TSNode, source: [*]const u8, parent_name: []const u8, file_path: []const u8, w: *JsonWriter, decorators: []const ts.TSNode) void {
     const name_node = ts.ts_node_child_by_field_name(node, "name", 4);
     if (ts.ts_node_is_null(name_node)) return;
     var qname: NameBuf = .{};
@@ -519,11 +603,14 @@ fn extractClass(node: ts.TSNode, source: [*]const u8, parent_name: []const u8, f
         }
     }
 
+    // Decorators
+    emitDecoratorEdges(decorators, qname.slice(), source, w);
+
     const body = ts.ts_node_child_by_field_name(node, "body", 4);
     if (!ts.ts_node_is_null(body)) extractWalkBody(body, source, qname.slice(), file_path, w);
 }
 
-fn extractFunction(node: ts.TSNode, source: [*]const u8, parent_name: []const u8, file_path: []const u8, w: *JsonWriter) void {
+fn extractFunction(node: ts.TSNode, source: [*]const u8, parent_name: []const u8, file_path: []const u8, w: *JsonWriter, decorators: []const ts.TSNode) void {
     const name_node = ts.ts_node_child_by_field_name(node, "name", 4);
     if (ts.ts_node_is_null(name_node)) return;
     var qname: NameBuf = .{};
@@ -535,6 +622,9 @@ fn extractFunction(node: ts.TSNode, source: [*]const u8, parent_name: []const u8
 
     writeEntity(w, kind, qname.slice(), file_path, node, source, result.m, result.ch, result.sh);
     writeEdge(w, parent_name, "contains", qname.slice(), true);
+
+    // Decorators
+    emitDecoratorEdges(decorators, qname.slice(), source, w);
 
     // Extract calls
     const body = ts.ts_node_child_by_field_name(node, "body", 4);
@@ -565,18 +655,30 @@ fn extractCalls(root: ts.TSNode, source: [*]const u8, caller: []const u8, class_
                     const obj = ts.ts_node_child_by_field_name(func, "object", 6);
                     const attr = ts.ts_node_child_by_field_name(func, "attribute", 9);
                     if (!ts.ts_node_is_null(obj) and !ts.ts_node_is_null(attr)) {
-                        if (isIdentifier(ts.ts_node_type(obj))) {
+                        const obj_type = ts.ts_node_type(obj);
+                        const attr_text = nodeSlice(attr, source);
+
+                        if (isIdentifier(obj_type)) {
                             const obj_text = nodeSlice(obj, source);
-                            const attr_text = nodeSlice(attr, source);
+                            // self.method() / cls.method() -> ClassName.method
                             if ((std.mem.eql(u8, obj_text, "self") or std.mem.eql(u8, obj_text, "cls")) and class_name != null) {
                                 var target: NameBuf = .{};
                                 target.set(class_name.?, attr_text);
                                 writeEdge(w, caller, "calls", target.slice(), true);
+                            } else if (std.mem.eql(u8, obj_text, "super")) {
+                                // super().method() — skip
                             } else {
                                 var target: NameBuf = .{};
                                 target.set(obj_text, attr_text);
                                 writeEdge(w, caller, "calls", target.slice(), false);
                             }
+                        } else if (isAttribute(obj_type)) {
+                            // module.sub.func() — full dotted name
+                            const obj_text = nodeSlice(obj, source);
+                            // Build "obj_text.attr_text"
+                            var target: NameBuf = .{};
+                            target.set(obj_text, attr_text);
+                            writeEdge(w, caller, "calls", target.slice(), false);
                         }
                     }
                 }
@@ -620,12 +722,96 @@ fn extractImports(root: ts.TSNode, source: [*]const u8, module_name: []const u8,
                 }
             }
         } else if (t == _import_from_statement) {
-            const mod_node = ts.ts_node_child_by_field_name(child, "module_name", 11);
-            if (!ts.ts_node_is_null(mod_node)) {
-                writeEdge(w, module_name, "imports", nodeSlice(mod_node, source), false);
+            // Check for relative import first
+            var resolved = false;
+            const nc = ts.ts_node_child_count(child);
+            for (0..nc) |i| {
+                const sub = ts.ts_node_child(child, @intCast(i));
+                if (ts.ts_node_type(sub) == _relative_import) {
+                    if (resolveRelativeImport(sub, source, module_name)) |target| {
+                        writeEdge(w, module_name, "imports", target, false);
+                        resolved = true;
+                    }
+                    break;
+                }
+            }
+            if (!resolved) {
+                // Absolute: from X.Y import Z
+                const mod_node = ts.ts_node_child_by_field_name(child, "module_name", 11);
+                if (!ts.ts_node_is_null(mod_node)) {
+                    writeEdge(w, module_name, "imports", nodeSlice(mod_node, source), false);
+                }
+            }
+        }
+        // Skip future_import_statement
+    }
+}
+
+fn resolveRelativeImport(rel_node: ts.TSNode, source: [*]const u8, module_name: []const u8) ?[]const u8 {
+    // Find import_prefix (the dots) and optional dotted_name
+    var prefix_text: ?[]const u8 = null;
+    var dotted_text: ?[]const u8 = null;
+    const nc = ts.ts_node_child_count(rel_node);
+    for (0..nc) |i| {
+        const child = ts.ts_node_child(rel_node, @intCast(i));
+        const ct = ts.ts_node_type(child);
+        if (ct == _import_prefix) {
+            prefix_text = nodeSlice(child, source);
+        } else if (ct == _dotted_name) {
+            dotted_text = nodeSlice(child, source);
+        }
+    }
+
+    const dots = if (prefix_text) |p| p.len else return null;
+    if (dots == 0) return null;
+
+    // Walk up the module path: count parts, go up `dots` levels
+    // "app.core.engine" with 1 dot -> "app.core"
+    // Find the last `dots` dots in module_name
+    var part_count: usize = 1;
+    for (module_name) |c| {
+        if (c == '.') part_count += 1;
+    }
+    if (dots > part_count) return null;
+
+    // Find the byte offset after the (part_count - dots)th part
+    var target_end: usize = 0;
+    var parts_seen: usize = 0;
+    const target_parts = part_count - dots;
+    if (target_parts == 0) {
+        // from ..X import Y where dots == depth of module
+        if (dotted_text) |dt| return dt;
+        return null;
+    }
+    for (module_name, 0..) |c, idx| {
+        if (c == '.') {
+            parts_seen += 1;
+            if (parts_seen == target_parts) {
+                target_end = idx;
+                break;
             }
         }
     }
+    if (target_end == 0 and parts_seen < target_parts) {
+        // Only one part remains
+        target_end = module_name.len;
+    }
+
+    const base = module_name[0..target_end];
+
+    if (dotted_text) |dt| {
+        // Build "base.dt" in a static buffer
+        const ImportBuf = struct {
+            var buf: [2048]u8 = undefined;
+        };
+        if (base.len + 1 + dt.len > ImportBuf.buf.len) return null;
+        @memcpy(ImportBuf.buf[0..base.len], base);
+        ImportBuf.buf[base.len] = '.';
+        @memcpy(ImportBuf.buf[base.len + 1 .. base.len + 1 + dt.len], dt);
+        return ImportBuf.buf[0 .. base.len + 1 + dt.len];
+    }
+
+    return base;
 }
 
 // --- Single-file export ---

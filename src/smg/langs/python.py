@@ -457,6 +457,7 @@ def _convert_native_result(data: tuple[list, list]) -> ExtractResult:
             file=r.get("file"),
             line=r.get("line"),
             end_line=r.get("end_line"),
+            docstring=r.get("doc"),
             metadata=metadata,
         ))
 
