@@ -11,3 +11,11 @@ wheels/
 
 # smg project-local graph data
 .smg/
+
+# Zig build artifacts
+native/.zig-cache/
+native/zig-out/
+
+# Tool / test caches
+.codex
+.hypothesis/
