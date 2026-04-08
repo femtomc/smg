@@ -237,6 +237,42 @@ def test_meta_option(tmp_path):
     assert data["metadata"]["pure"] == "yes"
 
 
+def test_concept_add_list_rm(tmp_path):
+    runner = _init_runner(tmp_path)
+    result = runner.invoke(
+        main,
+        [
+            "concept",
+            "add",
+            "cli",
+            "--prefix",
+            "app.cli",
+            "--prefix",
+            "app.api",
+            "--sync-point",
+            "app.cli.surface",
+        ],
+    )
+    assert result.exit_code == 0
+
+    result = runner.invoke(main, ["concept", "list"])
+    data = json.loads(result.output)
+    assert data == [
+        {
+            "kind": "concept",
+            "name": "cli",
+            "prefixes": ["app.cli", "app.api"],
+            "sync_points": ["app.cli.surface"],
+        }
+    ]
+
+    result = runner.invoke(main, ["concept", "rm", "cli"])
+    assert result.exit_code == 0
+
+    result = runner.invoke(main, ["concept", "list"])
+    assert json.loads(result.output) == []
+
+
 # --- Force text output tests ---
 
 
@@ -295,9 +331,25 @@ def test_about_depth_1(tmp_path):
     assert data["containment_path"] == ["app", "app.core", "app.core.Engine"]
 
 
+def test_about_filters_contains_by_default(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    result = runner.invoke(main, ["about", "app.core"])
+    data = json.loads(result.output)
+    assert data["outgoing"] == [{"target": "app.utils", "rel": "imports"}]
+    assert data["hidden_rels"] == {"incoming": 1, "outgoing": 1}
+
+
+def test_about_all_rels_includes_contains(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    result = runner.invoke(main, ["about", "app.core", "--all-rels"])
+    data = json.loads(result.output)
+    assert {"source": "app", "rel": "contains"} in data["incoming"]
+    assert {"target": "app.core.Engine", "rel": "contains"} in data["outgoing"]
+
+
 def test_about_depth_2(tmp_path):
     runner = _build_sample_graph(tmp_path)
-    result = runner.invoke(main, ["about", "app.core.Engine", "--depth", "2"])
+    result = runner.invoke(main, ["about", "app.core.Engine", "--depth", "2", "--all-rels"])
     data = json.loads(result.output)
     assert "neighbors" in data
     assert len(data["neighbors"]) > 0
@@ -309,7 +361,18 @@ def test_impact(tmp_path):
     data = json.loads(result.output)
     assert data["target"] == "app.utils.helper"
     assert "app.core.Engine.run" in data["affected"]
+    assert "app.utils" not in data["affected"]
+    assert data["coupling_only"] is True
     assert data["count"] > 0
+
+
+def test_impact_all_rels_includes_containment_chain(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    result = runner.invoke(main, ["impact", "app.utils.helper", "--all-rels"])
+    data = json.loads(result.output)
+    assert "app.utils" in data["affected"]
+    assert "app" in data["affected"]
+    assert data["coupling_only"] is False
 
 
 def test_impact_no_dependents(tmp_path):
@@ -423,3 +486,120 @@ def test_explicit_format_overrides(tmp_path):
     result = runner.invoke(main, ["show", "app", "--format", "text"])
     # Should NOT be JSON
     assert result.output.strip().startswith("╭") or "app" in result.output
+
+
+def test_analyze_without_concepts_omits_concept_section(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    runner.invoke(main, ["concept", "add", "core", "--prefix", "app.core"])
+    runner.invoke(main, ["concept", "add", "utils", "--prefix", "app.utils"])
+
+    result = runner.invoke(main, ["analyze", "--format", "json"])
+    data = json.loads(result.output)
+    assert "concepts" not in data
+
+
+def test_analyze_with_concepts_json(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    runner.invoke(main, ["concept", "add", "core", "--prefix", "app.core"])
+    runner.invoke(main, ["concept", "add", "utils", "--prefix", "app.utils"])
+
+    result = runner.invoke(main, ["analyze", "--concepts", "--format", "json"])
+    data = json.loads(result.output)
+
+    assert "concepts" in data
+    declared = {concept["name"]: concept for concept in data["concepts"]["declared"]}
+    assert declared["core"]["anchors"] == ["app.core"]
+    assert declared["core"]["members"] == 3
+    assert declared["core"]["cross_out"] == 2
+    assert declared["utils"]["members"] == 2
+    assert declared["utils"]["cross_in"] == 2
+
+    assert data["concepts"]["dependencies"] == [
+        {
+            "source": "core",
+            "target": "utils",
+            "edge_count": 2,
+            "rels": {"calls": 1, "imports": 1},
+            "witnesses": [
+                {
+                    "kind": "edge",
+                    "edges": [
+                        {
+                            "source": "app.core",
+                            "rel": "imports",
+                            "target": "app.utils",
+                        }
+                    ],
+                },
+                {
+                    "kind": "edge",
+                    "edges": [
+                        {
+                            "source": "app.core.Engine.run",
+                            "rel": "calls",
+                            "target": "app.utils.helper",
+                        }
+                    ],
+                },
+            ],
+            "allowed_sync": False,
+        }
+    ]
+    assert data["concepts"]["violations"] == [
+        {
+            "source": "core",
+            "target": "utils",
+            "message": "2 unsanctioned cross-concept edge(s)",
+            "witnesses": [
+                {
+                    "kind": "edge",
+                    "edges": [
+                        {
+                            "source": "app.core",
+                            "rel": "imports",
+                            "target": "app.utils",
+                        }
+                    ],
+                },
+                {
+                    "kind": "edge",
+                    "edges": [
+                        {
+                            "source": "app.core.Engine.run",
+                            "rel": "calls",
+                            "target": "app.utils.helper",
+                        }
+                    ],
+                },
+            ],
+        }
+    ]
+
+
+def test_analyze_with_concepts_summary_json(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    runner.invoke(main, ["concept", "add", "core", "--prefix", "app.core"])
+    runner.invoke(main, ["concept", "add", "utils", "--prefix", "app.utils"])
+
+    result = runner.invoke(main, ["analyze", "--concepts", "--summary", "--format", "json"])
+    data = json.loads(result.output)
+
+    assert "hotspots" in data
+    assert "graph" in data
+    assert "pagerank" in data
+    assert "betweenness" in data
+    assert "kcore" in data
+    assert "sdp_violations" in data
+    assert "dead_code" in data
+    assert "layering_violations" in data
+    assert "smells" in data
+    assert "concepts" in data
+
+    assert "classes" not in data
+    assert "modules" not in data
+    assert "fan_in_out" not in data
+    assert "hits" not in data
+
+    assert [concept["name"] for concept in data["concepts"]["declared"]] == ["core", "utils"]
+    assert len(data["concepts"]["dependencies"]) == 1
+    assert len(data["concepts"]["violations"]) == 1

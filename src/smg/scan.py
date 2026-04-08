@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import subprocess
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ DEFAULT_EXCLUDES = [
     "zig-cache",
     "zig-out",
 ]
+
+_PACKAGE_NAME_CACHE: dict[Path, str | None] = {}
 
 
 def load_smgignore(root: Path) -> list[str]:
@@ -75,6 +78,11 @@ def file_to_module_name(file_path: str, root: Path) -> str:
         rel = p.relative_to(root)
     else:
         rel = p
+
+    workspace_name = _workspace_module_name(rel, root)
+    if workspace_name is not None:
+        return workspace_name
+
     parts = list(rel.parts)
 
     # Detect src-layout: if first component is "src" and there's a package underneath
@@ -99,6 +107,63 @@ def file_to_module_name(file_path: str, root: Path) -> str:
             parts[-1] = stripped
 
     return ".".join(parts)
+
+
+def _workspace_module_name(rel_path: Path, root: Path) -> str | None:
+    abs_path = rel_path if rel_path.is_absolute() else root / rel_path
+    current = abs_path.parent
+
+    while True:
+        package_name = _load_package_name(current / "package.json")
+        if package_name is not None:
+            try:
+                package_rel = abs_path.relative_to(current)
+            except ValueError:
+                return None
+            return _module_name_from_parts(package_name, list(package_rel.parts))
+        if current == root or current.parent == current:
+            return None
+        current = current.parent
+
+
+def _load_package_name(package_json: Path) -> str | None:
+    cached = _PACKAGE_NAME_CACHE.get(package_json)
+    if package_json in _PACKAGE_NAME_CACHE:
+        return cached
+    if not package_json.exists():
+        _PACKAGE_NAME_CACHE[package_json] = None
+        return None
+    try:
+        data = json.loads(package_json.read_text())
+    except (OSError, json.JSONDecodeError):
+        _PACKAGE_NAME_CACHE[package_json] = None
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        _PACKAGE_NAME_CACHE[package_json] = None
+        return None
+    normalized = name.strip()
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+    normalized = normalized.replace("/", ".")
+    _PACKAGE_NAME_CACHE[package_json] = normalized
+    return normalized
+
+
+def _module_name_from_parts(prefix: str, parts: list[str]) -> str:
+    if len(parts) > 1 and parts[0] == "src":
+        parts = parts[1:]
+
+    if parts:
+        stripped = _strip_extension(parts[-1])
+        if stripped is not None:
+            if stripped in ("__init__", "index"):
+                parts = parts[:-1]
+            else:
+                parts[-1] = stripped
+
+    suffix = [part for part in parts if part]
+    return ".".join([prefix, *suffix]) if suffix else prefix
 
 
 _EXTENSIONS = (
@@ -387,7 +452,7 @@ def scan_paths(
 
     # Resolve deferred (unresolved) edges — all nodes are now in the graph
     for edge in deferred_edges:
-        resolved_target = _resolve_edge_target(graph, edge.target)
+        resolved_target = _resolve_edge_target(graph, edge)
         if resolved_target is None:
             stats.skipped_edges += 1
             continue
@@ -460,14 +525,80 @@ def changed_files(root: Path, since: str = "HEAD") -> list[Path]:
     return sorted(result)
 
 
-def _resolve_edge_target(graph: SemGraph, target: str) -> str | None:
+def _resolve_edge_target(graph: SemGraph, edge: Edge) -> str | None:
     """Try to resolve an unresolved edge target to a node in the graph."""
+    target = edge.target
     # Exact match
     if target in graph.nodes:
         return target
-    # Try suffix match (e.g. "Bar" -> "app.models.Bar")
+
     matches = graph.resolve_name(target)
+    if not matches:
+        return None
+    if edge.rel == RelType.CALLS:
+        return _resolve_call_target(graph, edge, matches)
     if len(matches) == 1:
         return matches[0]
-    # Unresolved
     return None
+
+
+def _resolve_call_target(graph: SemGraph, edge: Edge, matches: list[str]) -> str | None:
+    target = edge.target
+    source_module = _containing_ancestor(
+        graph,
+        edge.source,
+        {NodeType.MODULE.value, NodeType.PACKAGE.value},
+    )
+    source_class = _containing_ancestor(graph, edge.source, {NodeType.CLASS.value})
+
+    if "." not in target:
+        if source_module is not None:
+            candidate = f"{source_module}.{target}"
+            if _node_type_is(graph, candidate, NodeType.FUNCTION):
+                return candidate
+        if source_class is not None:
+            candidate = f"{source_class}.{target}"
+            if _node_type_is(graph, candidate, NodeType.METHOD):
+                return candidate
+
+        function_matches = [name for name in matches if _node_type_is(graph, name, NodeType.FUNCTION)]
+        if len(function_matches) == 1:
+            return function_matches[0]
+        if source_module is not None:
+            local_function_matches = [name for name in function_matches if name.startswith(source_module + ".")]
+            if len(local_function_matches) == 1:
+                return local_function_matches[0]
+        return None
+
+    if len(matches) == 1:
+        return matches[0]
+    if source_module is not None:
+        local_matches = [name for name in matches if name.startswith(source_module + ".")]
+        if len(local_matches) == 1:
+            return local_matches[0]
+    return None
+
+
+def _containing_ancestor(graph: SemGraph, name: str, node_types: set[str]) -> str | None:
+    current = name
+    seen: set[str] = set()
+
+    while current not in seen:
+        seen.add(current)
+        parent = next(
+            (edge.source for edge in graph.iter_incoming(current, rel=RelType.CONTAINS)),
+            None,
+        )
+        if parent is None:
+            return None
+        parent_node = graph.get_node(parent)
+        if parent_node is not None and parent_node.type.value in node_types:
+            return parent
+        current = parent
+
+    return None
+
+
+def _node_type_is(graph: SemGraph, name: str, node_type: NodeType) -> bool:
+    node = graph.get_node(name)
+    return node is not None and node.type == node_type

@@ -1,6 +1,6 @@
 # smg
 
-Parses source code into a semantic graph of modules, classes, functions, and their relationships, then runs graph-theoretic and OO metrics to surface hotspots, track structural change across commits, and enforce design constraints.
+`smg` turns source code into a semantic graph of modules, classes, functions, and their relationships. It already scans, queries, analyzes, diffs, exports, and enforces a useful baseline architecture graph for agents and humans.
 
 Really, this is for LM agents -- it's supposed to give them better (and more efficient) eyes on the structure of your codebase,
 and allow them to poke around and prod it as a graph of semantic entities.
@@ -42,6 +42,7 @@ smg between api.routes db   # How do these relate?
 # Analyze
 smg analyze                 # Architectural analysis with hotspot detection
 smg diff                    # What changed? (with rename/move detection)
+smg export dsm > deps.csv   # Dependency Structure Matrix export
 smg blame MyClass           # Who last touched this?
 smg context MyClass --tokens 8000  # Pack source for an LLM prompt
 
@@ -49,6 +50,52 @@ smg context MyClass --tokens 8000  # Pack source for an LLM prompt
 smg rule add acyclic --invariant no-cycles
 smg check                   # Enforce architectural rules
 ```
+
+## Current release
+
+This release ships the baseline architecture workflow plus three additions that
+used to be release candidates:
+
+- Quantified rules via `smg rule add --forall ... --assert ...`
+- Declared concept/group analysis via `smg concept ...` and `smg analyze --concepts`
+- Minimal witnesses in `smg check` text and JSON output
+
+The main remaining limitation is explicit: concept analysis is an analysis
+surface, not yet a `smg check` invariant. `smg analyze --concepts` reports
+unsanctioned cross-concept edges, but it does not fail CI on its own.
+
+## Contributor workflow
+
+Run these commands from the repo root. `--with-editable .` keeps the CLI and imports pointed at your checkout while `uv` resolves the required extras on demand.
+
+```bash
+# Test suite
+uv run --with-editable . --extra dev --extra scan python -m pytest -q
+
+# Type checking
+uv run --with-editable . --extra dev --extra scan python -m pyright
+```
+
+## Validation
+
+The reproducible validation command for code changes in this repository is:
+
+```bash
+uv run --with-editable . --extra dev --extra scan python -m pytest -q
+```
+
+When you want to dogfood the architecture workflow on this repository itself,
+refresh the local graph and run:
+
+```bash
+uv run --with-editable . --extra dev --extra scan python -m smg scan src tests --clean
+uv run --with-editable . --extra dev --extra scan python -m smg check --format json
+uv run --with-editable . --extra dev --extra scan python -m smg analyze --concepts --summary --format json
+```
+
+Concept declarations are stored in `.smg/concepts` when you add them locally.
+If that file is absent, `smg analyze --concepts` reports an empty declaration
+set instead of mutating `.smg/graph.jsonl`.
 
 ## The graph
 
@@ -280,6 +327,18 @@ smg rule add layered --invariant no-layering-violations
 | `no-dead-code` | Every non-entry node has at least one incoming coupling edge |
 | `no-layering-violations` | No back-dependency edges violate topological layering |
 
+### Quantified rules
+
+```bash
+smg rule add service-fan-out --forall "*.service" --assert "fan_out <= 5"
+smg rule add simple-handlers --forall "api.handlers.*" --assert "cyclomatic_complexity <= 10"
+```
+
+Quantified rules match subjects by glob and evaluate a small expression language
+over graph metrics, OO metrics, and scanner metadata. The current release
+supports per-subject universal checks; it does not yet support graph-wide
+aggregates such as `count(...)` or `sum(...)`.
+
 ### Checking rules
 
 ```bash
@@ -294,7 +353,31 @@ Exit code 0 means all rules pass; exit code 1 means at least one violation. This
 smg scan src/ --clean && smg check
 ```
 
-Rules are stored in `.smg/rules` (JSONL, same format as the graph) and persist across sessions.
+Failures include a `witnesses` list in JSON and show the first few witnesses in
+text output. Deny and layering rules emit edge witnesses, cycle rules emit
+minimal cycles, and quantified rules emit predicate witnesses with the observed
+metric facts.
+
+Rules are stored as JSONL records in `.smg/rules`. The file is created on first
+use and stays separate from `.smg/graph.jsonl`.
+
+## Concept and group analysis
+
+Declare higher-level module groups in a sidecar store, then lift the dependency
+graph to concept-level summaries and cross-concept witnesses.
+
+```bash
+smg concept add cli --prefix smg.cli
+smg concept add core --prefix smg.graph --prefix smg.model
+smg concept add core-api --prefix smg.api --sync-point smg.api.boundary
+smg concept list
+smg analyze --concepts
+```
+
+Concept declarations live in `.smg/concepts`, not in `.smg/graph.jsonl`. Use
+`--sync-point` to mark node-name prefixes that are allowed to cross a concept
+boundary. The `concepts` section is added to `smg analyze --format json` only
+when `--concepts` is requested.
 
 ## Agent usage
 
@@ -341,7 +424,7 @@ Output is automatically JSON when piped, rich text in terminal. No flags needed.
 | `smg between <A> <B>` | Shortest path + direct edges |
 | `smg overview [--top N]` | Graph stats + most connected nodes |
 | `smg diff [REF]` | Structural diff with rename/move detection (default: HEAD) |
-| `smg analyze [--top N] [--module PREFIX] [--summary] [--churn-days N]` | Architectural analysis with hotspot detection |
+| `smg analyze [--top N] [--module PREFIX] [--summary] [--concepts] [--churn-days N]` | Architectural analysis with hotspot detection |
 | `smg context <name> [--tokens N]` | Pack source code for LLM context within a token budget |
 | `smg blame <name\|file>` | Entity-level git blame: who last touched this? |
 
@@ -351,8 +434,12 @@ Output is automatically JSON when piped, rich text in terminal. No flags needed.
 |---------|---------|
 | `smg rule add <name> --deny "PATTERN"` | Forbid edges matching a glob pattern |
 | `smg rule add <name> --invariant TYPE` | Require a structural invariant |
+| `smg rule add <name> --forall "GLOB" --assert "EXPR"` | Enforce a per-subject metric budget |
 | `smg rule list` | List all rules |
 | `smg rule rm <name>` | Remove a rule |
+| `smg concept add <name> --prefix PREFIX [--sync-point PREFIX]...` | Declare a concept/group boundary |
+| `smg concept list` | List all concept declarations |
+| `smg concept rm <name>` | Remove a concept declaration |
 | `smg check [NAME]` | Check all rules (or one). Exit 1 on violation. |
 
 ### Inspect
@@ -394,6 +481,7 @@ Output is automatically JSON when piped, rich text in terminal. No flags needed.
 | `smg export mermaid` | Mermaid flowchart |
 | `smg export dot` | Graphviz DOT |
 | `smg export text` | Human-readable listing |
+| `smg export dsm [--level module\|class\|all]` | Dependency Structure Matrix as CSV |
 
 ## Reference
 
@@ -414,7 +502,17 @@ Output is automatically JSON when piped, rich text in terminal. No flags needed.
 {"kind":"edge","source":"app.core","rel":"contains","target":"app.core.Engine","metadata":{"source":"scan"}}
 ```
 
-Git-friendly, human-readable, parseable with zero tooling. Nodes sorted by name, edges by (source, rel, target). Written atomically via temp file + rename.
+Rules and concept declarations use separate JSONL sidecars, created on first
+use:
+
+```jsonl
+{"kind":"rule","name":"service-fan-out","type":"quantified","selector":"*.service","assertion":"fan_out <= 5"}
+{"kind":"concept","name":"cli","prefixes":["app.cli"],"sync_points":["app.cli.surface"]}
+```
+
+Keeping rules and concepts out of `.smg/graph.jsonl` preserves graph counts and
+analyses across rescans. All three stores are human-readable and written
+atomically via temp file + rename.
 
 ### Name resolution
 

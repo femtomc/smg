@@ -8,6 +8,8 @@ interface declarations, and uses type_identifier for class names.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tree_sitter import Language, Parser
 from tree_sitter import Node as TSNode
 
@@ -79,7 +81,7 @@ class _JSExtractorBase:
         nodes: list[Node] = []
         edges: list[Edge] = []
         self._walk_body(tree.root_node, source, module_name, file_path, nodes, edges)
-        self._extract_imports(tree.root_node, module_name, edges)
+        self._extract_imports(tree.root_node, module_name, file_path, edges)
         return ExtractResult(nodes=nodes, edges=edges)
 
     def _walk_body(
@@ -311,6 +313,7 @@ class _JSExtractorBase:
         self,
         root: TSNode,
         module_name: str,
+        file_path: str,
         out_edges: list[Edge],
     ) -> None:
         """Extract import statements as IMPORTS edges."""
@@ -319,7 +322,7 @@ class _JSExtractorBase:
                 # import X from "source" / import { X } from "source"
                 source = child.child_by_field_name("source")
                 if source is not None:
-                    target = self._import_source_to_module(source)
+                    target = self._import_source_to_module(source, module_name, file_path)
                     if target:
                         out_edges.append(
                             Edge(
@@ -330,25 +333,64 @@ class _JSExtractorBase:
                             )
                         )
 
-    def _import_source_to_module(self, source_node: TSNode) -> str | None:
+    def _import_source_to_module(
+        self,
+        source_node: TSNode,
+        module_name: str,
+        file_path: str,
+    ) -> str | None:
         """Convert an import source string node to a module name.
 
-        './utils' -> 'utils', '../lib/core' -> 'lib.core', 'express' -> 'express'
+        Relative imports are resolved against the importing module.
+        Bare package imports are normalized from npm notation to dotted names.
         """
         # Get the string content
         for child in source_node.children:
             if child.type == "string_fragment":
                 raw = child.text.decode()
-                # Strip relative prefixes
-                path = raw.lstrip("./")
+                path = self._strip_import_extension(raw)
                 if not path:
                     return None
-                # Convert path separators to dots, strip extensions
-                for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
-                    if path.endswith(ext):
-                        path = path[: -len(ext)]
-                return path.replace("/", ".")
+                if path.startswith("."):
+                    return self._resolve_relative_import(path, module_name, file_path)
+                return self._normalize_import_path(path)
         return None
+
+    def _strip_import_extension(self, path: str) -> str:
+        for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+            if path.endswith(ext):
+                return path[: -len(ext)]
+        return path
+
+    def _normalize_import_path(self, path: str) -> str | None:
+        cleaned = path[1:] if path.startswith("@") else path
+        parts = [part for part in cleaned.split("/") if part not in ("", ".")]
+        if not parts:
+            return None
+        if parts[-1] == "index":
+            parts.pop()
+        return ".".join(parts) if parts else None
+
+    def _resolve_relative_import(self, path: str, module_name: str, file_path: str) -> str | None:
+        base_parts = module_name.split(".")
+        if Path(file_path).stem not in ("index", "__init__"):
+            base_parts = base_parts[:-1]
+
+        parts = [part for part in path.split("/") if part]
+        resolved = list(base_parts)
+        for part in parts:
+            if part == ".":
+                continue
+            if part == "..":
+                if not resolved:
+                    return None
+                resolved.pop()
+                continue
+            resolved.append(part)
+
+        if resolved and resolved[-1] == "index":
+            resolved.pop()
+        return ".".join(resolved) if resolved else None
 
     def _extract_calls(
         self,

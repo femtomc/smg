@@ -466,6 +466,30 @@ def process():
 
 
 @needs_tree_sitter
+def test_scan_calls_do_not_bind_bare_name_to_unrelated_method(tmp_path):
+    root = tmp_path
+    pkg = root / "src" / "app"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").touch()
+    (pkg / "resolver.py").write_text("""\
+class CommandContextResolver:
+    def resolve(self):
+        return "ok"
+""")
+    (pkg / "main.py").write_text("""\
+def run():
+    resolve()
+""")
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "src"])
+
+    edges = graph.outgoing("app.main.run", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "app.resolver.CommandContextResolver.resolve" not in targets
+
+
+@needs_tree_sitter
 def test_scan_calls_builtins_skipped(tmp_path):
     """Calls to builtins (print, len, etc.) are not added as edges."""
     root = tmp_path

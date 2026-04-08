@@ -1,9 +1,4 @@
-"""Declarative architectural constraint system.
-
-Users declare rules (path denials, structural invariants) and check
-them against the graph. Violations report the specific edges/nodes
-that offend, inspired by Alloy's counterexample-driven feedback.
-"""
+"""Declarative architectural constraint system."""
 
 from __future__ import annotations
 
@@ -13,8 +8,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from smg import oo_metrics
 from smg.graph import SemGraph
-from smg.model import RelType
+from smg.model import Node, NodeType, RelType
+from smg.rule_expr import ParsedAssertion, evaluate_assertion, parse_assertion
+from smg.witness import Witness, cycle_witness, edge_witness, node_witness, predicate_witness
 
 _COUPLING_RELS = frozenset(
     {
@@ -37,40 +35,89 @@ KNOWN_INVARIANTS = frozenset(
     }
 )
 
+_TOTAL_METRIC_IDENTIFIERS = frozenset(
+    {
+        "fan_in",
+        "fan_out",
+        "layer",
+        "pagerank",
+        "betweenness",
+        "kcore",
+        "dead",
+        "in_cycle",
+    }
+)
+_NODE_METRIC_IDENTIFIERS = frozenset(
+    {
+        "cyclomatic_complexity",
+        "cognitive_complexity",
+        "nesting",
+    }
+)
+_CLASS_METRIC_IDENTIFIERS = frozenset(
+    {
+        "wmc",
+        "cbo",
+        "rfc",
+        "lcom4",
+        "dit",
+        "noc",
+        "max_method_cc",
+    }
+)
+_MODULE_METRIC_IDENTIFIERS = frozenset(
+    {
+        "instability",
+        "abstractness",
+        "distance",
+    }
+)
+KNOWN_METRIC_IDENTIFIERS = (
+    _TOTAL_METRIC_IDENTIFIERS | _NODE_METRIC_IDENTIFIERS | _CLASS_METRIC_IDENTIFIERS | _MODULE_METRIC_IDENTIFIERS
+)
+
 
 @dataclass
 class Rule:
     name: str
-    type: str  # "deny" or "invariant"
+    type: str  # "deny", "invariant", or "quantified"
     pattern: str | None = None
     invariant: str | None = None
+    selector: str | None = None
+    assertion: str | None = None
     params: dict[str, Any] = field(default_factory=dict)
-    scope: str | None = None  # optional module prefix to scope the rule
+    scope: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"kind": "rule", "name": self.name, "type": self.type}
+        data: dict[str, Any] = {"kind": "rule", "name": self.name, "type": self.type}
         if self.pattern is not None:
-            d["pattern"] = self.pattern
+            data["pattern"] = self.pattern
         if self.invariant is not None:
-            d["invariant"] = self.invariant
+            data["invariant"] = self.invariant
+        if self.selector is not None:
+            data["selector"] = self.selector
+        if self.assertion is not None:
+            data["assertion"] = self.assertion
         if self.params:
-            d["params"] = self.params
+            data["params"] = self.params
         if self.scope is not None:
-            d["scope"] = self.scope
-        return d
+            data["scope"] = self.scope
+        return data
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), separators=(",", ":"))
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> Rule:
+    def from_dict(cls, data: dict[str, Any]) -> Rule:
         return cls(
-            name=d["name"],
-            type=d["type"],
-            pattern=d.get("pattern"),
-            invariant=d.get("invariant"),
-            params=d.get("params", {}),
-            scope=d.get("scope"),
+            name=data["name"],
+            type=data["type"],
+            pattern=data.get("pattern"),
+            invariant=data.get("invariant"),
+            selector=data.get("selector"),
+            assertion=data.get("assertion"),
+            params=data.get("params", {}),
+            scope=data.get("scope"),
         )
 
 
@@ -79,56 +126,61 @@ class Violation:
     rule_name: str
     rule_type: str
     message: str
-    edges: list[dict] | None = None
+    edges: list[dict[str, Any]] | None = None
     nodes: list[str] | None = None
     cycles: list[list[str]] | None = None
+    witnesses: list[Witness] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        data: dict[str, Any] = {
             "rule": self.rule_name,
             "type": self.rule_type,
             "message": self.message,
         }
+        witnesses = self.witnesses or _legacy_witnesses(self)
+        if witnesses:
+            data["witnesses"] = [witness.to_dict() for witness in witnesses]
         if self.edges:
-            d["edges"] = self.edges
+            data["edges"] = self.edges
         if self.nodes:
-            d["nodes"] = self.nodes
+            data["nodes"] = self.nodes
         if self.cycles:
-            d["cycles"] = self.cycles
-        return d
+            data["cycles"] = self.cycles
+        return data
 
 
 def parse_deny_pattern(pattern: str) -> tuple[str, str | None, str]:
-    """Parse a deny pattern into (source_glob, rel_or_none, target_glob).
-
-    Accepted forms:
-        "ui.* -[calls]-> db.*"    -> ("ui.*", "calls", "db.*")
-        "ui.* -> db.*"            -> ("ui.*", None, "db.*")
-    """
-    m = _DENY_WITH_REL.match(pattern)
-    if m:
-        return m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
-    m = _DENY_ANY_REL.match(pattern)
-    if m:
-        return m.group(1).strip(), None, m.group(2).strip()
+    """Parse a deny pattern into (source_glob, rel_or_none, target_glob)."""
+    match = _DENY_WITH_REL.match(pattern)
+    if match:
+        return match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+    match = _DENY_ANY_REL.match(pattern)
+    if match:
+        return match.group(1).strip(), None, match.group(2).strip()
     raise ValueError(f"invalid deny pattern: {pattern!r}")
 
 
-def check_deny(
-    rule: Rule,
-    graph: SemGraph,
-    scope: str | None = None,
-) -> Violation | None:
+def parse_quantified_assertion(rule: Rule) -> ParsedAssertion:
+    """Parse a quantified rule assertion and reject unknown identifiers."""
+    if rule.assertion is None:
+        raise ValueError(f"quantified rule {rule.name!r} has no assertion")
+    parsed = parse_assertion(rule.assertion)
+    unknown = sorted(parsed.identifiers - KNOWN_METRIC_IDENTIFIERS)
+    if unknown:
+        raise ValueError(f"unknown metric identifier(s) in rule {rule.name!r}: {', '.join(unknown)}")
+    return parsed
+
+
+def check_deny(rule: Rule, graph: SemGraph, scope: str | None = None) -> Violation | None:
     """Check a path denial rule against the graph."""
     assert rule.pattern is not None, f"deny rule {rule.name!r} has no pattern"
     source_glob, rel, target_glob = parse_deny_pattern(rule.pattern)
 
-    # When scoped, only consider edges whose source is within the scope.
     scope_prefix: str | None = None
     if scope:
         scope_prefix = scope if scope.endswith(".") else scope + "."
 
-    offending: list[dict] = []
+    offending: list[dict[str, Any]] = []
     for edge in graph.all_edges():
         if rel is not None:
             if edge.rel.value != rel:
@@ -146,14 +198,15 @@ def check_deny(
                     "target": edge.target,
                 }
             )
-    if offending:
-        return Violation(
-            rule_name=rule.name,
-            rule_type="deny",
-            message=f"{len(offending)} forbidden edge(s)",
-            edges=offending,
-        )
-    return None
+    if not offending:
+        return None
+    return Violation(
+        rule_name=rule.name,
+        rule_type="deny",
+        message=f"{len(offending)} forbidden edge(s)",
+        edges=offending,
+        witnesses=[edge_witness(edge) for edge in offending],
+    )
 
 
 def check_invariant(rule: Rule, graph: SemGraph) -> Violation | None:
@@ -163,43 +216,46 @@ def check_invariant(rule: Rule, graph: SemGraph) -> Violation | None:
     inv = rule.invariant
     if inv == "no-cycles":
         cycles = graph_metrics.find_cycles(graph)
-        if cycles:
-            # Extract minimal cycle paths for actionable output
-            minimal_cycles = [graph_metrics.minimal_cycle(graph, scc) for scc in cycles]
-            return Violation(
-                rule_name=rule.name,
-                rule_type="invariant",
-                message=f"{len(cycles)} cycle(s)",
-                cycles=minimal_cycles,
-            )
-    elif inv == "no-dead-code":
+        if not cycles:
+            return None
+        minimal_cycles = [graph_metrics.minimal_cycle(graph, scc) for scc in cycles]
+        return Violation(
+            rule_name=rule.name,
+            rule_type="invariant",
+            message=f"{len(cycles)} cycle(s)",
+            cycles=minimal_cycles,
+            witnesses=[cycle_witness(cycle) for cycle in minimal_cycles],
+        )
+    if inv == "no-dead-code":
         entry_points: set[str] = set()
-        ep_raw = rule.params.get("entry_points", "")
-        if ep_raw:
-            patterns = [p.strip() for p in ep_raw.split(",") if p.strip()]
+        raw = rule.params.get("entry_points", "")
+        if raw:
+            patterns = [pattern.strip() for pattern in raw.split(",") if pattern.strip()]
             all_names = list(graph.nodes.keys())
-            for pat in patterns:
-                entry_points.update(fnmatch.filter(all_names, pat))
+            for pattern in patterns:
+                entry_points.update(fnmatch.filter(all_names, pattern))
         dead = graph_metrics.dead_code(graph, entry_points=entry_points)
-        if dead:
-            return Violation(
-                rule_name=rule.name,
-                rule_type="invariant",
-                message=f"{len(dead)} unreferenced node(s)",
-                nodes=dead,
-            )
-    elif inv == "no-layering-violations":
+        if not dead:
+            return None
+        return Violation(
+            rule_name=rule.name,
+            rule_type="invariant",
+            message=f"{len(dead)} unreferenced node(s)",
+            nodes=dead,
+            witnesses=[node_witness(node) for node in dead],
+        )
+    if inv == "no-layering-violations":
         violations = graph_metrics.layering_violations(graph)
-        if violations:
-            return Violation(
-                rule_name=rule.name,
-                rule_type="invariant",
-                message=f"{len(violations)} back-dependency edge(s)",
-                edges=violations,
-            )
-    else:
-        raise ValueError(f"unknown invariant: {inv!r}")
-    return None
+        if not violations:
+            return None
+        return Violation(
+            rule_name=rule.name,
+            rule_type="invariant",
+            message=f"{len(violations)} back-dependency edge(s)",
+            edges=violations,
+            witnesses=[edge_witness(edge) for edge in violations],
+        )
+    raise ValueError(f"unknown invariant: {inv!r}")
 
 
 def _scope_graph_for_rule(graph: SemGraph, scope: str) -> SemGraph:
@@ -215,25 +271,191 @@ def _scope_graph_for_rule(graph: SemGraph, scope: str) -> SemGraph:
     return scoped
 
 
-def check_rule(rule: Rule, graph: SemGraph) -> Violation | None:
+class QuantifiedMetricCatalog:
+    """Lazy metric bag for quantified rules."""
+
+    def __init__(self, graph: SemGraph) -> None:
+        self.graph = graph
+        self._cache: dict[str, Any] = {}
+
+    def facts_for(self, subject: str, identifiers: frozenset[str]) -> dict[str, Any]:
+        node = self.graph.get_node(subject)
+        if node is None:
+            raise ValueError(f"unknown subject {subject!r}")
+        facts: dict[str, Any] = {}
+        for identifier in sorted(identifiers):
+            facts[identifier] = self.value_for(subject, node, identifier)
+        return facts
+
+    def value_for(self, subject: str, node: Node, identifier: str) -> Any:
+        if identifier in _TOTAL_METRIC_IDENTIFIERS:
+            return self._total_metric_value(subject, identifier)
+        if identifier in _NODE_METRIC_IDENTIFIERS:
+            return self._node_metric_value(subject, node, identifier)
+        if identifier in _CLASS_METRIC_IDENTIFIERS:
+            if node.type != NodeType.CLASS:
+                raise ValueError(
+                    f"quantified rule metric {identifier!r} is not defined for non-class subject {subject!r}"
+                )
+            values = self._cache_for(identifier)
+            return values[subject]
+        if identifier in _MODULE_METRIC_IDENTIFIERS:
+            if node.type not in {NodeType.MODULE, NodeType.PACKAGE}:
+                raise ValueError(
+                    f"quantified rule metric {identifier!r} is not defined for non-module subject {subject!r}"
+                )
+            values = self._cache_for("martin")
+            return values[subject][identifier]
+        raise ValueError(f"unknown metric identifier: {identifier!r}")
+
+    def _total_metric_value(self, subject: str, identifier: str) -> Any:
+        if identifier in {"fan_in", "fan_out"}:
+            values = self._cache_for("fan_in_out")
+            return values.get(subject, {}).get(identifier, 0)
+        if identifier == "layer":
+            return self._cache_for("layers").get(subject, 0)
+        if identifier == "pagerank":
+            return self._cache_for("pagerank").get(subject, 0.0)
+        if identifier == "betweenness":
+            return self._cache_for("betweenness").get(subject, 0.0)
+        if identifier == "kcore":
+            return self._cache_for("kcore").get(subject, 0)
+        if identifier == "dead":
+            return subject in self._cache_for("dead")
+        if identifier == "in_cycle":
+            return subject in self._cache_for("in_cycle")
+        raise ValueError(f"unknown metric identifier: {identifier!r}")
+
+    def _node_metric_value(self, subject: str, node: Node, identifier: str) -> Any:
+        metrics = node.metadata.get("metrics", {})
+        key = "max_nesting_depth" if identifier == "nesting" else identifier
+        if key not in metrics:
+            raise ValueError(f"quantified rule metric {identifier!r} is not defined for subject {subject!r}")
+        return metrics[key]
+
+    def _cache_for(self, key: str) -> Any:
+        if key in self._cache:
+            return self._cache[key]
+
+        from smg import graph_metrics
+
+        if key == "fan_in_out":
+            value = graph_metrics.fan_in_out(self.graph)
+        elif key == "layers":
+            value = graph_metrics.topological_layers(self.graph)
+        elif key == "pagerank":
+            value = graph_metrics.pagerank(self.graph)
+        elif key == "betweenness":
+            value = graph_metrics.betweenness_centrality(self.graph)
+        elif key == "kcore":
+            value = graph_metrics.kcore_decomposition(self.graph)
+        elif key == "dead":
+            value = set(graph_metrics.dead_code(self.graph))
+        elif key == "in_cycle":
+            value = {node for cycle in graph_metrics.find_cycles(self.graph) for node in cycle}
+        elif key == "martin":
+            value = oo_metrics.martin_metrics(self.graph)
+        else:
+            value = getattr(oo_metrics, key)(self.graph)
+        self._cache[key] = value
+        return value
+
+
+def check_quantified(
+    rule: Rule,
+    graph: SemGraph,
+    *,
+    parsed_assertion: ParsedAssertion | None = None,
+    metric_catalog: QuantifiedMetricCatalog | None = None,
+) -> Violation | None:
+    """Check a quantified rule against the current graph."""
+    if rule.selector is None:
+        raise ValueError(f"quantified rule {rule.name!r} has no selector")
+    parsed = parsed_assertion or parse_quantified_assertion(rule)
+    catalog = metric_catalog or QuantifiedMetricCatalog(graph)
+
+    subjects = sorted(node.name for node in graph.all_nodes() if fnmatch.fnmatch(node.name, rule.selector))
+    if rule.scope:
+        prefix = rule.scope if rule.scope.endswith(".") else rule.scope + "."
+        subjects = [subject for subject in subjects if subject == rule.scope or subject.startswith(prefix)]
+    if not subjects:
+        return None
+
+    failing_subjects: list[str] = []
+    witnesses: list[Witness] = []
+    for subject in subjects:
+        facts = catalog.facts_for(subject, parsed.identifiers)
+        try:
+            matched = evaluate_assertion(parsed, facts)
+        except KeyError as exc:
+            raise ValueError(
+                f"quantified rule {rule.name!r} needs metric {exc.args[0]!r} for subject {subject!r}"
+            ) from exc
+        if not isinstance(matched, bool):
+            raise ValueError(f"quantified rule {rule.name!r} did not evaluate to a boolean")
+        if not matched:
+            failing_subjects.append(subject)
+            witnesses.append(predicate_witness(subject, parsed.source, facts))
+
+    if not failing_subjects:
+        return None
+    return Violation(
+        rule_name=rule.name,
+        rule_type="quantified",
+        message=f"{len(failing_subjects)} subject(s) failed {parsed.source}",
+        nodes=failing_subjects,
+        witnesses=witnesses,
+    )
+
+
+def check_rule(
+    rule: Rule,
+    graph: SemGraph,
+    *,
+    parsed_assertion: ParsedAssertion | None = None,
+    metric_catalog: QuantifiedMetricCatalog | None = None,
+) -> Violation | None:
     """Check a single rule against the graph."""
     if rule.type == "deny":
-        # Deny rules handle scope internally so cross-boundary targets
-        # are visible for pattern matching.
         return check_deny(rule, graph, scope=rule.scope)
+    if rule.type == "quantified":
+        return check_quantified(
+            rule,
+            graph,
+            parsed_assertion=parsed_assertion,
+            metric_catalog=metric_catalog,
+        )
     if rule.scope:
         graph = _scope_graph_for_rule(graph, rule.scope)
     if rule.type == "invariant":
         return check_invariant(rule, graph)
-    else:
-        raise ValueError(f"unknown rule type: {rule.type!r}")
+    raise ValueError(f"unknown rule type: {rule.type!r}")
 
 
 def check_all(rules: list[Rule], graph: SemGraph) -> list[Violation]:
-    """Check all rules, return list of violations (empty = all pass)."""
+    """Check all rules, return list of violations."""
+    parsed_assertions = {rule.name: parse_quantified_assertion(rule) for rule in rules if rule.type == "quantified"}
+    metric_catalog = QuantifiedMetricCatalog(graph) if parsed_assertions else None
+
     violations: list[Violation] = []
     for rule in rules:
-        v = check_rule(rule, graph)
-        if v is not None:
-            violations.append(v)
+        violation = check_rule(
+            rule,
+            graph,
+            parsed_assertion=parsed_assertions.get(rule.name),
+            metric_catalog=metric_catalog,
+        )
+        if violation is not None:
+            violations.append(violation)
     return violations
+
+
+def _legacy_witnesses(violation: Violation) -> list[Witness]:
+    witnesses: list[Witness] = []
+    if violation.edges:
+        witnesses.extend(edge_witness(edge) for edge in violation.edges)
+    if violation.nodes:
+        witnesses.extend(node_witness(node) for node in violation.nodes)
+    if violation.cycles:
+        witnesses.extend(cycle_witness(cycle) for cycle in violation.cycles)
+    return witnesses

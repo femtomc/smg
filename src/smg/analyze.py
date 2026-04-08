@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from smg import graph_metrics, oo_metrics
 from smg.churn import ChurnResult, compute_churn
 from smg.graph import SemGraph
+
+if TYPE_CHECKING:
+    from smg.concepts import Concept, ConceptAnalysis
 
 
 @dataclass
@@ -61,6 +64,7 @@ class AnalysisResult:
 
     # Synthesized
     hotspots: list[dict] = field(default_factory=list)
+    concepts: ConceptAnalysis | None = None
 
 
 def run_analysis(
@@ -68,6 +72,7 @@ def run_analysis(
     root: Path | None = None,
     churn_days: int = 90,
     full: bool = True,
+    declared_concepts: list[Concept] | None = None,
     on_step: Callable[[str], None] | None = None,
 ) -> AnalysisResult:
     """Run all analyses on a graph and return structured results.
@@ -77,6 +82,7 @@ def run_analysis(
         root: Project root (needed for churn). None to skip churn.
         churn_days: Time window for git churn analysis.
         full: If False, skip expensive non-summary metrics (fan-in/out, HITS, max_method_cc).
+        declared_concepts: Optional declared concepts to materialize and analyze.
         on_step: Optional callback for progress reporting.
     """
     r = AnalysisResult()
@@ -142,6 +148,12 @@ def run_analysis(
     # Hotspot synthesis
     step("Computing hotspots...")
     r.hotspots = _synthesize_hotspots(graph, r)
+
+    if declared_concepts is not None:
+        from smg.concepts import analyze_concepts
+
+        step("Analyzing concepts...")
+        r.concepts = analyze_concepts(graph, declared_concepts)
 
     return r
 

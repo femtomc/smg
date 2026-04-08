@@ -53,7 +53,7 @@ click.rich_click.COMMAND_GROUPS = {
                 "blame",
             ],
         },
-        {"name": "Enforce", "commands": ["rule", "check"]},
+        {"name": "Enforce", "commands": ["rule", "concept", "check"]},
         {
             "name": "Inspect",
             "commands": ["show", "list", "status", "query", "validate"],
@@ -276,4 +276,4 @@ def _output_edges(edges: list[Edge], fmt: str) -> None:
 
 
 # Import submodules to register commands on `main`
-from smg.cli import _export, enforce, explore, inspect, mutate  # noqa: F401, E402
+from smg.cli import _export, concepts, enforce, explore, inspect, mutate  # noqa: F401, E402

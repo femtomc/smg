@@ -44,6 +44,7 @@ from smg.rules import (
     check_all,
     check_deny,
     check_invariant,
+    check_rule,
     parse_deny_pattern,
 )
 
@@ -1220,6 +1221,16 @@ def random_invariant_rule(draw):
     return Rule(name=name, type="invariant", invariant=inv, params=params)
 
 
+@st.composite
+def random_quantified_rule(draw):
+    """Generate a quantified rule over graph metrics with total defaults."""
+    metric = draw(st.sampled_from(["fan_in", "fan_out", "layer", "kcore"]))
+    threshold = draw(st.integers(min_value=0, max_value=5))
+    op = draw(st.sampled_from(["<=", ">=", "=="]))
+    name = draw(st.text(alphabet="abcdefghijklmnopqrstuvwxyz", min_size=1, max_size=6))
+    return Rule(name=name, type="quantified", selector="*", assertion=f"{metric} {op} {threshold}")
+
+
 class TestDenyRuleProperties:
     @given(random_graph(), random_deny_rule())
     @settings(max_examples=100)
@@ -1387,3 +1398,42 @@ class TestRuleSerializationProperties:
         src, rel, tgt = parse_deny_pattern(rule.pattern)
         assert src
         assert tgt
+
+    @given(random_quantified_rule())
+    @settings(max_examples=100)
+    def test_quantified_rule_round_trip(self, rule: Rule):
+        """Serializing and deserializing a quantified rule preserves all fields."""
+        data = rule.to_dict()
+        restored = Rule.from_dict(data)
+        assert restored.name == rule.name
+        assert restored.type == rule.type
+        assert restored.selector == rule.selector
+        assert restored.assertion == rule.assertion
+
+
+class TestQuantifiedRuleProperties:
+    @given(random_graph(), random_quantified_rule())
+    @settings(max_examples=100)
+    def test_quantified_witnesses_reference_real_subjects_and_facts(self, g: SemGraph, rule: Rule):
+        """Every quantified witness must report a real subject and true metric facts."""
+        violation = check_rule(rule, g)
+        if violation is None:
+            return
+
+        fan = fan_in_out(g)
+        layers = topological_layers(g)
+        kcore = kcore_decomposition(g)
+
+        assert violation.witnesses is not None
+        for witness in violation.witnesses:
+            assert witness.subject in g.nodes
+            assert witness.facts is not None
+            for metric, value in witness.facts.items():
+                if metric == "fan_in":
+                    assert value == fan.get(witness.subject, {}).get("fan_in", 0)
+                elif metric == "fan_out":
+                    assert value == fan.get(witness.subject, {}).get("fan_out", 0)
+                elif metric == "layer":
+                    assert value == layers.get(witness.subject, 0)
+                elif metric == "kcore":
+                    assert value == kcore.get(witness.subject, 0)

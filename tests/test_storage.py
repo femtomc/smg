@@ -1,8 +1,9 @@
 from pathlib import Path
 
+from smg.concepts import Concept
 from smg.graph import SemGraph
 from smg.model import Edge, Node, NodeType, RelType
-from smg.storage import find_root, init_project, load_graph, save_graph
+from smg.storage import find_root, init_project, load_concepts, load_graph, save_concepts, save_graph
 
 
 def test_init_project(tmp_path: Path):
@@ -15,6 +16,19 @@ def test_init_project_idempotent(tmp_path: Path):
     init_project(tmp_path)
     init_project(tmp_path)  # should not fail
     assert (tmp_path / ".smg" / "graph.jsonl").exists()
+
+
+def test_init_project_adds_smg_to_git_info_exclude(tmp_path: Path):
+    exclude_file = tmp_path / ".git" / "info" / "exclude"
+    exclude_file.parent.mkdir(parents=True)
+    exclude_file.write_text("# local excludes\n")
+
+    init_project(tmp_path)
+    init_project(tmp_path)
+
+    lines = exclude_file.read_text().splitlines()
+    assert ".smg/" in lines
+    assert lines.count(".smg/") == 1
 
 
 def test_save_and_load(tmp_path: Path):
@@ -76,3 +90,24 @@ def test_save_deterministic(tmp_path: Path):
     assert '"name":"a"' in lines[0]
     assert '"name":"z"' in lines[1]
     assert '"kind":"edge"' in lines[2]
+
+
+def test_load_concepts_missing_file(tmp_path: Path):
+    init_project(tmp_path)
+    assert load_concepts(tmp_path) == []
+
+
+def test_save_and_load_concepts(tmp_path: Path):
+    init_project(tmp_path)
+    save_concepts(
+        [
+            Concept(name="cli", prefixes=["app.cli"], sync_points=["app.cli.surface"]),
+            Concept(name="core", prefixes=["app.core"]),
+        ],
+        tmp_path,
+    )
+
+    concepts = load_concepts(tmp_path)
+    assert [concept.name for concept in concepts] == ["cli", "core"]
+    assert concepts[0].prefixes == ["app.cli"]
+    assert concepts[0].sync_points == ["app.cli.surface"]

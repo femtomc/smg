@@ -5,6 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
+from smg.concepts import Concept
 from smg.graph import SemGraph
 from smg.model import Edge, Node
 from smg.rules import Rule
@@ -12,6 +13,7 @@ from smg.rules import Rule
 SMG_DIR = ".smg"
 GRAPH_FILE = "graph.jsonl"
 RULES_FILE = "rules"
+CONCEPTS_FILE = "concepts"
 
 
 def find_root(start: Path | None = None) -> Path | None:
@@ -34,7 +36,29 @@ def init_project(path: Path | None = None) -> Path:
     graph_file = smg_dir / GRAPH_FILE
     if not graph_file.exists():
         graph_file.touch()
+    _ensure_git_exclude(root, f"{SMG_DIR}/")
     return root
+
+
+def _ensure_git_exclude(root: Path, pattern: str) -> None:
+    """Best-effort local git ignore to keep .smg/ out of status noise."""
+    exclude_file = root / ".git" / "info" / "exclude"
+    if not exclude_file.exists():
+        return
+
+    try:
+        existing = exclude_file.read_text()
+    except OSError:
+        return
+
+    if pattern in {line.strip() for line in existing.splitlines()}:
+        return
+
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    try:
+        exclude_file.write_text(f"{existing}{prefix}{pattern}\n")
+    except OSError:
+        return
 
 
 def load_graph(root: Path) -> SemGraph:
@@ -119,6 +143,42 @@ def save_rules(rules: list[Rule], root: Path) -> None:
             for line in lines:
                 f.write(line + "\n")
         os.replace(tmp_path, rules_file)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def load_concepts(root: Path) -> list[Concept]:
+    """Read .smg/concepts and return a list of concept declarations."""
+    concepts_file = root / SMG_DIR / CONCEPTS_FILE
+    if not concepts_file.exists():
+        return []
+    concepts: list[Concept] = []
+    with open(concepts_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            concepts.append(Concept.from_dict(json.loads(line)))
+    return concepts
+
+
+def save_concepts(concepts: list[Concept], root: Path) -> None:
+    """Serialize concepts to .smg/concepts atomically."""
+    smg_dir = root / SMG_DIR
+    concepts_file = smg_dir / CONCEPTS_FILE
+
+    lines = [concept.to_json() for concept in sorted(concepts, key=lambda concept: concept.name)]
+
+    fd, tmp_path = tempfile.mkstemp(dir=smg_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        os.replace(tmp_path, concepts_file)
     except BaseException:
         try:
             os.unlink(tmp_path)

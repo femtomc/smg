@@ -1,5 +1,7 @@
 """Tests for JavaScript and TypeScript extraction."""
 
+import json
+
 import pytest
 
 from smg.model import NodeType, RelType
@@ -55,6 +57,14 @@ def test_file_to_module_name_tsx(tmp_path):
     (tmp_path / "tsconfig.json").write_text("{}")
     (tmp_path / "src" / "components").mkdir(parents=True)
     assert file_to_module_name("src/components/Button.tsx", tmp_path) == "components.Button"
+
+
+def test_file_to_module_name_workspace_package(tmp_path):
+    package_root = tmp_path / "packages" / "core"
+    package_root.mkdir(parents=True)
+    (package_root / "package.json").write_text(json.dumps({"name": "@repo/core"}))
+    (package_root / "src" / "lib").mkdir(parents=True)
+    assert file_to_module_name("packages/core/src/lib/util.ts", tmp_path) == "repo.core.lib.util"
 
 
 # --- TypeScript extraction ---
@@ -275,12 +285,52 @@ def test_ts_imports(tmp_path):
     graph = load_graph(root)
     scan_paths(graph, root, [root / "src"])
 
-    # server.ts imports from ./utils -> resolves to app.utils? No, import source is "utils"
-    # which gets converted to "utils" -> suffix match -> app.utils? Depends on resolution.
-    # The import edge source string is the relative path converted to dot notation.
     edges = graph.outgoing("app.server", rel=RelType.IMPORTS)
-    # At minimum we should have an imports edge (may or may not resolve depending on matching)
-    assert len(edges) >= 0  # just verify no crash
+    targets = {e.target for e in edges}
+    assert "app.utils" in targets
+
+
+def _write_ts_workspace(tmp_path):
+    root = tmp_path
+    (root / "package.json").write_text(json.dumps({"private": True, "workspaces": ["packages/*"]}))
+
+    core = root / "packages" / "core"
+    (core / "src").mkdir(parents=True)
+    (core / "package.json").write_text(json.dumps({"name": "@repo/core"}))
+    (core / "src" / "utils.ts").write_text("""\
+export function helper(name: string): string {
+  return name.trim();
+}
+""")
+
+    app = root / "packages" / "app"
+    (app / "src").mkdir(parents=True)
+    (app / "package.json").write_text(json.dumps({"name": "@repo/app"}))
+    (app / "src" / "index.ts").write_text("""\
+import { helper } from "@repo/core/utils";
+
+export function run(name: string): string {
+  return helper(name);
+}
+""")
+    return root
+
+
+@needs_ts
+def test_ts_workspace_package_names_and_imports(tmp_path):
+    root = _write_ts_workspace(tmp_path)
+    init_project(root)
+    graph = load_graph(root)
+    scan_paths(graph, root, [root / "packages"])
+
+    assert graph.get_node("repo.app") is not None
+    assert graph.get_node("repo.core.utils") is not None
+
+    import_targets = {e.target for e in graph.outgoing("repo.app", rel=RelType.IMPORTS)}
+    assert "repo.core.utils" in import_targets
+
+    call_targets = {e.target for e in graph.outgoing("repo.app.run", rel=RelType.CALLS)}
+    assert "repo.core.utils.helper" in call_targets
 
 
 # --- JavaScript extraction ---

@@ -5,6 +5,16 @@ from collections import deque
 from smg.graph import SemGraph
 from smg.model import RelType
 
+COUPLING_RELS = frozenset(
+    {
+        RelType.CALLS.value,
+        RelType.IMPORTS.value,
+        RelType.INHERITS.value,
+        RelType.IMPLEMENTS.value,
+        RelType.DEPENDS_ON.value,
+    }
+)
+
 
 def transitive_deps(
     graph: SemGraph,
@@ -55,6 +65,7 @@ def subgraph(
     name: str,
     depth: int = 2,
     direction: str = "both",
+    rel_types: set[str] | None = None,
 ) -> SemGraph:
     """Return a new SemGraph containing nodes within `depth` hops of `name`."""
     if name not in graph.nodes:
@@ -66,7 +77,7 @@ def subgraph(
     for _ in range(depth):
         next_frontier: set[str] = set()
         for node_name in frontier:
-            for neighbor in graph.iter_neighbors(node_name, direction=direction):
+            for neighbor in _iter_neighbors(graph, node_name, direction=direction, rel_types=rel_types):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     next_frontier.add(neighbor)
@@ -81,7 +92,7 @@ def subgraph(
         if node is not None:
             sub.add_node(node)
 
-    for edge in graph.iter_edges():
+    for edge in graph.iter_edges(rel_types=rel_types):
         if edge.source in visited and edge.target in visited:
             sub.add_edge(edge)
 
@@ -91,6 +102,7 @@ def subgraph(
 def impact(
     graph: SemGraph,
     name: str,
+    rel_types: set[str] | None = None,
     max_depth: int | None = None,
 ) -> list[str]:
     """All nodes reachable via incoming edges of any type (reverse transitive closure)."""
@@ -102,6 +114,8 @@ def impact(
         if max_depth is not None and depth >= max_depth:
             continue
         for edge in graph.iter_incoming(current):
+            if rel_types is not None and edge.rel.value not in rel_types:
+                continue
             if edge.source not in visited:
                 visited.add(edge.source)
                 queue.append((edge.source, depth + 1))
@@ -186,3 +200,27 @@ def _bfs_incoming(
                 queue.append((edge.source, depth + 1))
 
     return sorted(visited - {start})
+
+
+def _iter_neighbors(
+    graph: SemGraph,
+    name: str,
+    direction: str,
+    rel_types: set[str] | None,
+):
+    if rel_types is None:
+        yield from graph.iter_neighbors(name, direction=direction)
+        return
+
+    if direction in ("out", "both"):
+        for edge in graph.iter_outgoing(name):
+            if edge.rel.value in rel_types:
+                yield edge.target
+
+    if direction in ("in", "both"):
+        seen: set[str] = set()
+        if direction == "both":
+            seen.update(edge.target for edge in graph.iter_outgoing(name) if edge.rel.value in rel_types)
+        for edge in graph.iter_incoming(name):
+            if edge.rel.value in rel_types and edge.source not in seen:
+                yield edge.source

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import rich_click as click
 
 if TYPE_CHECKING:
     from smg.analyze import AnalysisResult
+    from smg.concepts import ConceptAnalysis
 from rich.panel import Panel
 from rich.table import Table
 
 from smg import query
 from smg.cli import (
     EXIT_NOT_FOUND,
+    EXIT_VALIDATION,
     _auto_fmt,
     _load,
     _rel_style,
@@ -42,7 +44,12 @@ from smg.model import RelType
     type=click.Choice(["text", "json"]),
     help="Output format (auto-detects: JSON when piped)",
 )
-def about(name: str, depth: int, fmt: str | None) -> None:
+@click.option(
+    "--coupling-only/--all-rels",
+    default=True,
+    help="Show only architecture-significant coupling edges by default",
+)
+def about(name: str, depth: int, fmt: str | None, coupling_only: bool) -> None:
     """What is X? Progressive context card for a node.
 
     \b
@@ -50,6 +57,8 @@ def about(name: str, depth: int, fmt: str | None) -> None:
       --depth 0  Identity only (name, type, file, docstring)
       --depth 1  + connections (incoming/outgoing edges, containment path)
       --depth 2  + 2-hop neighborhood (all nearby nodes)
+    By default, only coupling edges are shown. Use [bold]--all-rels[/] to include
+    containment and annotation edges.
     Short names work: smg about SemGraph → smg.graph.SemGraph
     """
     import json as json_mod
@@ -65,16 +74,22 @@ def about(name: str, depth: int, fmt: str | None) -> None:
     node_dict.pop("kind", None)
 
     data: dict = {"node": node_dict}
+    rel_types = set(query.COUPLING_RELS) if coupling_only else None
 
     if depth >= 1:
-        inc = graph.incoming(name)
-        out = graph.outgoing(name)
+        inc = [edge for edge in graph.incoming(name) if rel_types is None or edge.rel.value in rel_types]
+        out = [edge for edge in graph.outgoing(name) if rel_types is None or edge.rel.value in rel_types]
         data["containment_path"] = query.containment_path(graph, name)
         data["incoming"] = [{"source": e.source, "rel": e.rel.value} for e in inc]
         data["outgoing"] = [{"target": e.target, "rel": e.rel.value} for e in out]
+        if coupling_only:
+            data["hidden_rels"] = {
+                "incoming": graph.incoming_count(name) - len(inc),
+                "outgoing": graph.outgoing_count(name) - len(out),
+            }
 
     if depth >= 2:
-        sub = query.subgraph(graph, name, depth=2)
+        sub = query.subgraph(graph, name, depth=2, rel_types=rel_types)
         neighbor_names = sorted(n for n in sub.nodes if n != name)
         data["neighbors"] = neighbor_names
 
@@ -118,6 +133,17 @@ def about(name: str, depth: int, fmt: str | None) -> None:
             lines.append(f"[bold]Outgoing[/] ({len(out_edges)})")
             for e in out_edges:
                 lines.append(f"  [dim]--{_rel_style(e['rel'])}-->[/] {e['target']}")
+
+        if coupling_only:
+            hidden = data.get("hidden_rels", {})
+            hidden_in = hidden.get("incoming", 0)
+            hidden_out = hidden.get("outgoing", 0)
+            hidden_total = hidden_in + hidden_out
+            if hidden_total:
+                lines.append("")
+                lines.append(
+                    f"[dim]{hidden_total} hidden non-coupling edge(s); rerun with --all-rels to include them[/]"
+                )
 
     if depth >= 2:
         neighbors = data["neighbors"]
@@ -231,11 +257,17 @@ def usages(name: str, rel: str | None, fmt: str | None) -> None:
     type=click.Choice(["text", "json"]),
     help="Output format (auto-detects: JSON when piped)",
 )
-def impact(name: str, depth: int | None, fmt: str | None) -> None:
+@click.option(
+    "--coupling-only/--all-rels",
+    default=True,
+    help="Follow only architecture-significant coupling edges by default",
+)
+def impact(name: str, depth: int | None, fmt: str | None, coupling_only: bool) -> None:
     """What breaks if I change X? Reverse transitive impact analysis.
 
-    Follows ALL incoming edges (calls, imports, contains, etc.) transitively
-    to find every node that could be affected by a change to X.
+    Follows incoming coupling edges transitively by default to find the nodes
+    most likely to be architecturally affected by a change to X. Use
+    [bold]--all-rels[/] to include containment and annotation edges too.
 
     \b
     Example: smg impact auth.service
@@ -245,7 +277,8 @@ def impact(name: str, depth: int | None, fmt: str | None) -> None:
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
-    affected = query.impact(graph, name, max_depth=depth)
+    rel_types = set(query.COUPLING_RELS) if coupling_only else None
+    affected = query.impact(graph, name, rel_types=rel_types, max_depth=depth)
 
     if fmt == "json":
         click.echo(
@@ -254,6 +287,7 @@ def impact(name: str, depth: int | None, fmt: str | None) -> None:
                     "target": name,
                     "affected": affected,
                     "count": len(affected),
+                    "coupling_only": coupling_only,
                 },
                 indent=2,
             )
@@ -578,6 +612,12 @@ def diff(ref: str, fmt: str | None) -> None:
     help="Show only hotspots and key findings, skip full listings",
 )
 @click.option(
+    "--concepts",
+    "include_concepts",
+    is_flag=True,
+    help="Include declared concept/group analysis",
+)
+@click.option(
     "--churn-days",
     default=90,
     type=int,
@@ -595,6 +635,7 @@ def analyze(
     module_filter: str | None,
     since_ref: str | None,
     summary: bool,
+    include_concepts: bool,
     churn_days: int,
     fmt: str | None,
 ) -> None:
@@ -611,15 +652,17 @@ def analyze(
     Examples:
       smg analyze                        # full analysis
       smg analyze --module bellman       # scope to bellman.* nodes
+      smg analyze --concepts             # add declared concept analysis
       smg analyze --summary --top 5     # just hotspots and key findings
       smg analyze --format json         # structured output for agents
 
     \b
     JSON output keys: hotspots, graph, pagerank, betweenness,
     kcore (with members), classes, modules, sdp_violations,
-    fan_in_out, dead_code, layering_violations, smells
+    fan_in_out, dead_code, layering_violations, smells, concepts
     """
     from smg.analyze import filter_to_delta, run_analysis
+    from smg.concepts import ConceptConfigurationError
 
     graph, _root = _load()
     fmt = _auto_fmt(fmt)
@@ -665,8 +708,27 @@ def analyze(
         if progress_ctx is not None and task_id is not None:
             progress_ctx.update(task_id, description=desc)
 
+    declared_concepts = None
+    if include_concepts:
+        from smg.storage import load_concepts
+
+        declared_concepts = load_concepts(_root)
+
     # Run analysis
-    r = run_analysis(graph, root=_root, churn_days=churn_days, full=not summary, on_step=_step)
+    try:
+        r = run_analysis(
+            graph,
+            root=_root,
+            churn_days=churn_days,
+            full=not summary,
+            declared_concepts=declared_concepts,
+            on_step=_step,
+        )
+    except ConceptConfigurationError as e:
+        if progress_ctx is not None:
+            progress_ctx.stop()
+        err_console.print(f"[red]Error:[/] {e}")
+        sys.exit(EXIT_VALIDATION)
 
     if progress_ctx is not None:
         progress_ctx.stop()
@@ -760,7 +822,78 @@ def _render_analyze_json(r: "AnalysisResult", graph: SemGraph, top_n: int, summa
             "top_hubs": [{"name": n, **v} for n, v in hits_hubs],
             "top_authorities": [{"name": n, **v} for n, v in hits_auths],
         }
+    if r.concepts is not None:
+        data["concepts"] = r.concepts.to_dict()
     click.echo(json_mod.dumps(data, indent=2))
+
+
+def _render_concepts_text(concepts: "ConceptAnalysis", top_n: int) -> None:
+    concept_data: dict[str, Any] = concepts.to_dict()
+    declared = concept_data["declared"]
+    dependencies = concept_data["dependencies"]
+    violations = concept_data["violations"]
+
+    assert isinstance(declared, list)
+    assert isinstance(dependencies, list)
+    assert isinstance(violations, list)
+
+    console.print("\n[bold]Concepts[/]")
+    if not declared:
+        console.print("  [dim]No concept declarations found.[/]")
+        return
+
+    summary_table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+    summary_table.add_column("Name", style="bold")
+    summary_table.add_column("Members", justify="right")
+    summary_table.add_column("Internal", justify="right")
+    summary_table.add_column("Cross In", justify="right")
+    summary_table.add_column("Cross Out", justify="right")
+    summary_table.add_column("Density", justify="right")
+    summary_table.add_column("Fan-Out", justify="right")
+    summary_table.add_column("Asym", justify="right")
+    for concept in declared:
+        assert isinstance(concept, dict)
+        summary_table.add_row(
+            concept["name"],
+            str(concept["members"]),
+            str(concept["internal_edges"]),
+            str(concept["cross_in"]),
+            str(concept["cross_out"]),
+            f"{concept['sync_density']:.3f}",
+            str(concept["sync_fan_out"]),
+            f"{concept['sync_asymmetry']:.3f}",
+        )
+    console.print(summary_table)
+
+    if dependencies:
+        console.print(f"\n[bold]Concept Dependencies[/] ({len(dependencies)})")
+        for dependency in dependencies[:top_n]:
+            assert isinstance(dependency, dict)
+            sync_label = "allowed" if dependency["allowed_sync"] else "unsanctioned"
+            rels = ", ".join(f"{rel}={count}" for rel, count in dependency["rels"].items())
+            console.print(
+                f"  {dependency['source']} -> {dependency['target']}"
+                f" [dim]({dependency['edge_count']} edge(s), {rels}, {sync_label})[/]"
+            )
+            witness = dependency["witnesses"][0]["edges"][0] if dependency["witnesses"] else None
+            if witness is not None:
+                assert isinstance(witness, dict)
+                console.print(f"    {witness['source']} [dim]--{_rel_style(witness['rel'])}-->[/] {witness['target']}")
+        if len(dependencies) > top_n:
+            console.print(f"  [dim]... and {len(dependencies) - top_n} more[/]")
+
+    if violations:
+        console.print(f"\n[red bold]Concept Violations[/] ({len(violations)})")
+        for violation in violations[:top_n]:
+            assert isinstance(violation, dict)
+            console.print(f"  [red]-[/] {violation['source']} -> {violation['target']}: {violation['message']}")
+            for witness in violation["witnesses"][:2]:
+                assert isinstance(witness, dict)
+                edge = witness["edges"][0]
+                assert isinstance(edge, dict)
+                console.print(f"      {edge['source']} [dim]--{_rel_style(edge['rel'])}-->[/] {edge['target']}")
+        if len(violations) > top_n:
+            console.print(f"  [dim]... and {len(violations) - top_n} more[/]")
 
 
 def _render_analyze_text(
@@ -874,6 +1007,9 @@ def _render_analyze_text(
         for i, (cname, touches) in enumerate(churn_top, 1):
             churn_table.add_row(str(i), cname, str(touches))
         console.print(churn_table)
+
+    if r.concepts is not None:
+        _render_concepts_text(r.concepts, top_n)
 
     if summary:
         console.print(

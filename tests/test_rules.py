@@ -8,6 +8,7 @@ from click.testing import CliRunner
 from smg.cli import main
 from smg.graph import SemGraph
 from smg.model import Edge, Node, NodeType, RelType
+from smg.rule_expr import evaluate_assertion, parse_assertion
 from smg.rules import (
     Rule,
     check_all,
@@ -67,6 +68,29 @@ def test_rule_invariant_round_trip():
     r2 = Rule.from_dict(d)
     assert r2.invariant == "no-cycles"
     assert r2.params == {"foo": "bar"}
+
+
+def test_rule_quantified_round_trip():
+    r = Rule(name="fan-out", type="quantified", selector="api.*", assertion="fan_out <= 5", scope="api")
+    d = r.to_dict()
+    r2 = Rule.from_dict(d)
+    assert r2.type == "quantified"
+    assert r2.selector == "api.*"
+    assert r2.assertion == "fan_out <= 5"
+    assert r2.scope == "api"
+
+
+def test_parse_assertion_identifiers():
+    parsed = parse_assertion("fan_out <= 5 and not in_cycle")
+    assert parsed.identifiers == frozenset({"fan_out", "in_cycle"})
+    assert evaluate_assertion(parsed, {"fan_out": 3, "in_cycle": False}) is True
+
+
+def test_parse_assertion_rejects_calls():
+    import pytest
+
+    with pytest.raises(ValueError, match="unsupported syntax"):
+        parse_assertion("metric()")
 
 
 # --- Deny rule checking ---
@@ -219,6 +243,44 @@ def test_check_rule_dispatches():
     assert v is not None
 
 
+def test_check_quantified_graph_metric_violation():
+    g = _make_graph()
+    r = Rule(name="fan-out", type="quantified", selector="*", assertion="fan_out <= 0")
+    v = check_rule(r, g)
+    assert v is not None
+    assert v.nodes == ["core.lib", "ui.app"]
+    assert v.witnesses is not None
+    assert [w.subject for w in v.witnesses] == ["core.lib", "ui.app"]
+    assert [w.facts for w in v.witnesses] == [{"fan_out": 1}, {"fan_out": 1}]
+
+
+def test_check_quantified_node_metric_violation():
+    g = SemGraph()
+    g.add_node(
+        Node(
+            name="api.handler",
+            type=NodeType.FUNCTION,
+            metadata={"metrics": {"cyclomatic_complexity": 7, "cognitive_complexity": 5, "max_nesting_depth": 2}},
+        )
+    )
+    r = Rule(name="simple-handler", type="quantified", selector="api.*", assertion="cyclomatic_complexity <= 5")
+    v = check_rule(r, g)
+    assert v is not None
+    assert v.nodes == ["api.handler"]
+    assert v.witnesses is not None
+    assert v.witnesses[0].facts == {"cyclomatic_complexity": 7}
+
+
+def test_check_quantified_missing_metric_errors():
+    import pytest
+
+    g = SemGraph()
+    g.add_node(Node(name="api.handler", type=NodeType.FUNCTION))
+    r = Rule(name="class-budget", type="quantified", selector="api.*", assertion="wmc <= 10")
+    with pytest.raises(ValueError, match="not defined for non-class subject"):
+        check_rule(r, g)
+
+
 def test_check_all_mixed():
     g = _make_graph()
     rules = [
@@ -264,6 +326,24 @@ def test_cli_rule_add_invariant(tmp_path):
     result = runner.invoke(main, ["rule", "add", "acyclic", "--invariant", "no-cycles"])
     assert result.exit_code == 0
     assert "added" in result.output
+
+
+def test_cli_rule_add_quantified(tmp_path):
+    runner = _init_with_graph(tmp_path)
+    result = runner.invoke(main, ["rule", "add", "fan-out", "--forall", "*", "--assert", "fan_out <= 5"])
+    assert result.exit_code == 0
+    listed = runner.invoke(main, ["rule", "list"])
+    data = json.loads(listed.output)
+    assert data[0]["type"] == "quantified"
+    assert data[0]["selector"] == "*"
+    assert data[0]["assertion"] == "fan_out <= 5"
+
+
+def test_cli_rule_add_quantified_unknown_metric(tmp_path):
+    runner = _init_with_graph(tmp_path)
+    result = runner.invoke(main, ["rule", "add", "bad", "--forall", "*", "--assert", "mystery <= 1"])
+    assert result.exit_code == 2
+    assert "unknown metric identifier" in result.output
 
 
 def test_cli_rule_add_duplicate(tmp_path):
@@ -333,7 +413,42 @@ def test_cli_check_violation(tmp_path):
     assert data["status"] == "fail"
     assert len(data["violations"]) == 1
     assert data["violations"][0]["rule"] == "no-ui-db"
+    assert "witnesses" in data["violations"][0]
     assert result.exit_code == 1
+
+
+def test_cli_check_quantified_violation_json(tmp_path):
+    runner = _init_with_graph(tmp_path)
+    runner.invoke(main, ["rule", "add", "fan-out", "--forall", "*", "--assert", "fan_out <= 0"])
+    result = runner.invoke(main, ["check"])
+    data = json.loads(result.output)
+    assert data["status"] == "fail"
+    violation = data["violations"][0]
+    assert violation["type"] == "quantified"
+    assert violation["nodes"] == ["core.lib", "ui.app"]
+    assert violation["witnesses"] == [
+        {
+            "kind": "predicate",
+            "subject": "core.lib",
+            "assertion": "fan_out <= 0",
+            "facts": {"fan_out": 1},
+        },
+        {
+            "kind": "predicate",
+            "subject": "ui.app",
+            "assertion": "fan_out <= 0",
+            "facts": {"fan_out": 1},
+        },
+    ]
+    assert result.exit_code == 1
+
+
+def test_cli_check_quantified_config_error(tmp_path):
+    runner = _init_with_graph(tmp_path)
+    runner.invoke(main, ["rule", "add", "bad", "--forall", "*", "--assert", "wmc <= 1"])
+    result = runner.invoke(main, ["check"])
+    assert result.exit_code == 2
+    assert "not defined for non-class subject" in result.output
 
 
 def test_cli_check_specific_rule(tmp_path):
@@ -361,6 +476,15 @@ def test_cli_check_text_output(tmp_path):
     assert "FAIL" in result.output
     assert "PASS" in result.output
     assert "ui.app" in result.output
+
+
+def test_cli_check_quantified_text_output(tmp_path):
+    runner = _init_with_graph(tmp_path)
+    runner.invoke(main, ["rule", "add", "fan-out", "--forall", "*", "--assert", "fan_out <= 0"])
+    result = runner.invoke(main, ["check", "--format", "text"])
+    assert "FAIL" in result.output
+    assert "core.lib: fan_out=1" in result.output
+    assert "ui.app: fan_out=1" in result.output
 
 
 # --- Scoped deny rules ---
