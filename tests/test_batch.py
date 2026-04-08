@@ -23,14 +23,14 @@ def test_batch_add(tmp_path):
             '{"op":"add","type":"function","name":"app.main","file":"app.py","line":1}',
         ]
     )
-    result = runner.invoke(main, ["batch"], input=commands)
+    result = runner.invoke(main, ["batch", "--format", "json"], input=commands)
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["ok"] == 2
     assert data["errors"] == 0
 
     # Verify nodes exist
-    result = runner.invoke(main, ["show", "app.main"])
+    result = runner.invoke(main, ["show", "app.main", "--format", "json"])
     node = json.loads(result.output)
     assert node["name"] == "app.main"
     assert node["file"] == "app.py"
@@ -45,11 +45,11 @@ def test_batch_link(tmp_path):
             '{"op":"link","source":"a","rel":"imports","target":"b"}',
         ]
     )
-    result = runner.invoke(main, ["batch"], input=commands)
+    result = runner.invoke(main, ["batch", "--format", "json"], input=commands)
     data = json.loads(result.output)
     assert data["ok"] == 3
 
-    result = runner.invoke(main, ["query", "outgoing", "a", "--rel", "imports"])
+    result = runner.invoke(main, ["query", "outgoing", "a", "--rel", "imports", "--format", "json"])
     edges = json.loads(result.output)
     assert len(edges) == 1
     assert edges[0]["target"] == "b"
@@ -64,13 +64,13 @@ def test_batch_rm(tmp_path):
             '{"op":"link","source":"app","rel":"contains","target":"app.main"}',
         ]
     )
-    runner.invoke(main, ["batch"], input=setup)
+    runner.invoke(main, ["batch", "--format", "json"], input=setup)
 
-    result = runner.invoke(main, ["batch"], input='{"op":"rm","name":"app.main"}')
+    result = runner.invoke(main, ["batch", "--format", "json"], input='{"op":"rm","name":"app.main"}')
     data = json.loads(result.output)
     assert data["ok"] == 1
 
-    result = runner.invoke(main, ["list"])
+    result = runner.invoke(main, ["list", "--json-legacy"])
     nodes = json.loads(result.output)
     names = [n["name"] for n in nodes]
     assert "app.main" not in names
@@ -85,11 +85,11 @@ def test_batch_unlink(tmp_path):
             '{"op":"link","source":"a","rel":"imports","target":"b"}',
         ]
     )
-    runner.invoke(main, ["batch"], input=setup)
+    runner.invoke(main, ["batch", "--format", "json"], input=setup)
 
     result = runner.invoke(
         main,
-        ["batch"],
+        ["batch", "--format", "json"],
         input='{"op":"unlink","source":"a","rel":"imports","target":"b"}',
     )
     data = json.loads(result.output)
@@ -98,17 +98,17 @@ def test_batch_unlink(tmp_path):
 
 def test_batch_update(tmp_path):
     runner = _init_runner(tmp_path)
-    runner.invoke(main, ["batch"], input='{"op":"add","type":"module","name":"app"}')
+    runner.invoke(main, ["batch", "--format", "json"], input='{"op":"add","type":"module","name":"app"}')
 
     result = runner.invoke(
         main,
-        ["batch"],
+        ["batch", "--format", "json"],
         input='{"op":"update","name":"app","type":"package","doc":"My app","metadata":{"version":"1.0"}}',
     )
     data = json.loads(result.output)
     assert data["ok"] == 1
 
-    result = runner.invoke(main, ["show", "app"])
+    result = runner.invoke(main, ["show", "app", "--format", "json"])
     node = json.loads(result.output)
     assert node["type"] == "package"
     assert node["docstring"] == "My app"
@@ -117,7 +117,7 @@ def test_batch_update(tmp_path):
 
 def test_batch_error_invalid_json(tmp_path):
     runner = _init_runner(tmp_path)
-    result = runner.invoke(main, ["batch"], input="not json at all")
+    result = runner.invoke(main, ["batch", "--format", "json"], input="not json at all")
     data = json.loads(result.output)
     assert data["errors"] == 1
     assert "invalid JSON" in data["ops"][0]["error"]
@@ -125,7 +125,7 @@ def test_batch_error_invalid_json(tmp_path):
 
 def test_batch_error_unknown_op(tmp_path):
     runner = _init_runner(tmp_path)
-    result = runner.invoke(main, ["batch"], input='{"op":"explode"}')
+    result = runner.invoke(main, ["batch", "--format", "json"], input='{"op":"explode"}')
     data = json.loads(result.output)
     assert data["errors"] == 1
     assert "unknown op" in data["ops"][0]["error"]
@@ -133,7 +133,9 @@ def test_batch_error_unknown_op(tmp_path):
 
 def test_batch_error_missing_node(tmp_path):
     runner = _init_runner(tmp_path)
-    result = runner.invoke(main, ["batch"], input='{"op":"link","source":"x","rel":"calls","target":"y"}')
+    result = runner.invoke(
+        main, ["batch", "--format", "json"], input='{"op":"link","source":"x","rel":"calls","target":"y"}'
+    )
     data = json.loads(result.output)
     assert data["errors"] == 1
 
@@ -147,7 +149,7 @@ def test_batch_mixed_success_and_errors(tmp_path):
             '{"op":"add","type":"function","name":"app.main"}',
         ]
     )
-    result = runner.invoke(main, ["batch"], input=commands)
+    result = runner.invoke(main, ["batch", "--format", "json"], input=commands)
     data = json.loads(result.output)
     assert data["ok"] == 2
     assert data["errors"] == 1
@@ -155,7 +157,7 @@ def test_batch_mixed_success_and_errors(tmp_path):
 
 def test_batch_empty_input(tmp_path):
     runner = _init_runner(tmp_path)
-    result = runner.invoke(main, ["batch"], input="")
+    result = runner.invoke(main, ["batch", "--format", "json"], input="")
     data = json.loads(result.output)
     assert data["ok"] == 0
     assert data["errors"] == 0
@@ -164,7 +166,7 @@ def test_batch_empty_input(tmp_path):
 def test_batch_blank_lines_skipped(tmp_path):
     runner = _init_runner(tmp_path)
     commands = '\n\n{"op":"add","type":"module","name":"app"}\n\n'
-    result = runner.invoke(main, ["batch"], input=commands)
+    result = runner.invoke(main, ["batch", "--format", "json"], input=commands)
     data = json.loads(result.output)
     assert data["ok"] == 1
     assert data["errors"] == 0

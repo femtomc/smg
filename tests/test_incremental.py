@@ -77,7 +77,7 @@ def test_manual_add_sets_provenance(tmp_path):
     runner.invoke(main, ["init"])
     runner.invoke(main, ["add", "endpoint", "/api/test"])
 
-    result = runner.invoke(main, ["show", "/api/test"])
+    result = runner.invoke(main, ["show", "/api/test", "--format", "json"])
     data = json.loads(result.output)
     assert data["metadata"]["source"] == "manual"
 
@@ -96,7 +96,7 @@ def test_manual_link_sets_provenance(tmp_path):
     runner.invoke(main, ["add", "module", "b"])
     runner.invoke(main, ["link", "a", "tests", "b"])
 
-    result = runner.invoke(main, ["query", "outgoing", "a", "--rel", "tests"])
+    result = runner.invoke(main, ["query", "outgoing", "a", "--rel", "tests", "--format", "json"])
     edges = json.loads(result.output)
     assert len(edges) == 1
     assert edges[0].get("metadata", {}).get("source") == "manual"
@@ -270,7 +270,7 @@ def test_scan_changed_cli(tmp_path):
     (pkg / "core.py").write_text("def hello():\n    pass\n\ndef world():\n    pass\n")
 
     # Scan only changed files
-    result = runner.invoke(main, ["scan", "--changed"])
+    result = runner.invoke(main, ["scan", "--changed", "--format", "json"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["files"] >= 1
@@ -304,7 +304,7 @@ def test_scan_since_cli(tmp_path):
     os.system(f"git -C {root} add -A && git -C {root} commit -q -m change")
 
     # Scan since previous commit
-    result = runner.invoke(main, ["scan", "--since", "HEAD~1"])
+    result = runner.invoke(main, ["scan", "--since", "HEAD~1", "--format", "json"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["files"] >= 1
@@ -330,6 +330,6 @@ def test_batch_sets_provenance(tmp_path):
     )
     runner.invoke(main, ["batch"], input=commands)
 
-    result = runner.invoke(main, ["show", "x"])
+    result = runner.invoke(main, ["show", "x", "--format", "json"])
     data = json.loads(result.output)
     assert data["metadata"]["source"] == "manual"

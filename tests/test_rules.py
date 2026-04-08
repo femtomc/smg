@@ -332,7 +332,7 @@ def test_cli_rule_add_quantified(tmp_path):
     runner = _init_with_graph(tmp_path)
     result = runner.invoke(main, ["rule", "add", "fan-out", "--forall", "*", "--assert", "fan_out <= 5"])
     assert result.exit_code == 0
-    listed = runner.invoke(main, ["rule", "list"])
+    listed = runner.invoke(main, ["rule", "list", "--format", "json"])
     data = json.loads(listed.output)
     assert data[0]["type"] == "quantified"
     assert data[0]["selector"] == "*"
@@ -370,7 +370,7 @@ def test_cli_rule_list(tmp_path):
     runner = _init_with_graph(tmp_path)
     runner.invoke(main, ["rule", "add", "r1", "--deny", "a.* -> b.*"])
     runner.invoke(main, ["rule", "add", "r2", "--invariant", "no-cycles"])
-    result = runner.invoke(main, ["rule", "list"])
+    result = runner.invoke(main, ["rule", "list", "--format", "json"])
     data = json.loads(result.output)
     assert len(data) == 2
     names = {r["name"] for r in data}
@@ -384,7 +384,7 @@ def test_cli_rule_rm(tmp_path):
     assert result.exit_code == 0
     assert "removed" in result.output.lower()
     # Verify it's gone
-    result = runner.invoke(main, ["rule", "list"])
+    result = runner.invoke(main, ["rule", "list", "--format", "json"])
     data = json.loads(result.output)
     assert len(data) == 0
 
@@ -398,7 +398,7 @@ def test_cli_rule_rm_not_found(tmp_path):
 def test_cli_check_pass(tmp_path):
     runner = _init_with_graph(tmp_path)
     runner.invoke(main, ["rule", "add", "r1", "--deny", "db.* -> ui.*"])
-    result = runner.invoke(main, ["check"])
+    result = runner.invoke(main, ["check", "--format", "json"])
     data = json.loads(result.output)
     assert data["status"] == "pass"
     assert result.exit_code == 0
@@ -408,7 +408,7 @@ def test_cli_check_violation(tmp_path):
     runner = _init_with_graph(tmp_path)
     # ui.app calls db.query — this deny rule should catch it
     runner.invoke(main, ["rule", "add", "no-ui-db", "--deny", "ui.* -> db.*"])
-    result = runner.invoke(main, ["check"])
+    result = runner.invoke(main, ["check", "--format", "json"])
     data = json.loads(result.output)
     assert data["status"] == "fail"
     assert len(data["violations"]) == 1
@@ -420,7 +420,7 @@ def test_cli_check_violation(tmp_path):
 def test_cli_check_quantified_violation_json(tmp_path):
     runner = _init_with_graph(tmp_path)
     runner.invoke(main, ["rule", "add", "fan-out", "--forall", "*", "--assert", "fan_out <= 0"])
-    result = runner.invoke(main, ["check"])
+    result = runner.invoke(main, ["check", "--format", "json"])
     data = json.loads(result.output)
     assert data["status"] == "fail"
     violation = data["violations"][0]
@@ -455,7 +455,7 @@ def test_cli_check_specific_rule(tmp_path):
     runner = _init_with_graph(tmp_path)
     runner.invoke(main, ["rule", "add", "r1", "--deny", "ui.* -> db.*"])
     runner.invoke(main, ["rule", "add", "r2", "--deny", "db.* -> ui.*"])
-    result = runner.invoke(main, ["check", "r2"])
+    result = runner.invoke(main, ["check", "r2", "--format", "json"])
     data = json.loads(result.output)
     assert data["status"] == "pass"
     assert data["rules_checked"] == 1
@@ -463,7 +463,7 @@ def test_cli_check_specific_rule(tmp_path):
 
 def test_cli_check_no_rules(tmp_path):
     runner = _init_with_graph(tmp_path)
-    result = runner.invoke(main, ["check"])
+    result = runner.invoke(main, ["check", "--format", "json"])
     data = json.loads(result.output)
     assert data["status"] == "no_rules"
 

@@ -99,6 +99,9 @@ def watch_and_scan(
         graph = old_graph.clone()
         stats = scan_paths(graph, root, files, clean=True)
         save_graph(graph, root)
+        from smg.search import rebuild_search_index
+
+        rebuild_search_index(graph, root)
         result = diff_graphs(old_graph, graph)
         if on_scan:
             on_scan(result, stats, files)

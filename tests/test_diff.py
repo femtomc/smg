@@ -186,7 +186,7 @@ def test_diff_cli(tmp_path):
     os.system(f"git init {tmp_path} -q")
     runner.invoke(main, ["init"])
     runner.invoke(main, ["add", "module", "app"])
-    result = runner.invoke(main, ["diff"])
+    result = runner.invoke(main, ["diff", "--format", "json"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     # No baseline in git, so everything is "added"

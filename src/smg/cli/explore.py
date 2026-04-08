@@ -13,9 +13,11 @@ from rich.table import Table
 
 from smg import query
 from smg.cli import (
+    _DEFAULT_LIMIT,
     EXIT_NOT_FOUND,
     EXIT_VALIDATION,
     _auto_fmt,
+    _compact_table,
     _load,
     _rel_style,
     _resolve_or_exit,
@@ -42,14 +44,15 @@ from smg.model import RelType
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 @click.option(
     "--coupling-only/--all-rels",
     default=True,
     help="Show only architecture-significant coupling edges by default",
 )
-def about(name: str, depth: int, fmt: str | None, coupling_only: bool) -> None:
+@click.option("--full", is_flag=True, help="Show all edges and neighbors (no truncation)")
+def about(name: str, depth: int, fmt: str | None, coupling_only: bool, full: bool) -> None:
     """What is X? Progressive context card for a node.
 
     \b
@@ -97,67 +100,119 @@ def about(name: str, depth: int, fmt: str | None, coupling_only: bool) -> None:
         click.echo(json_mod.dumps(data, indent=2))
         return
 
-    # Rich text output
-    title = f"[bold]{node.name}[/]  [{_type_badge(node.type.value)}]"
-    lines: list[str] = []
+    # Build content lines (shared between TTY and piped)
+    edge_cap = 0 if full else 10
 
+    loc = ""
     if node.file:
         loc = node.file
         if node.line is not None:
             loc += f":{node.line}"
             if node.end_line is not None and node.end_line != node.line:
                 loc += f"-{node.end_line}"
-        lines.append(f"[dim]file:[/]  {loc}")
-    if node.docstring:
-        lines.append(f"[dim]doc:[/]   {node.docstring.split(chr(10))[0]}")
-    if node.metadata:
-        for k, v in sorted(node.metadata.items()):
-            lines.append(f"[dim]{k}:[/]  {v}")
 
-    if depth >= 1:
-        cpath = data["containment_path"]
-        if len(cpath) > 1:
-            lines.append("")
-            lines.append(f"[bold]Path:[/] {' > '.join(cpath)}")
-
-        inc_edges = data["incoming"]
-        if inc_edges:
-            lines.append("")
-            lines.append(f"[bold]Incoming[/] ({len(inc_edges)})")
-            for e in inc_edges:
-                lines.append(f"  {e['source']} [dim]--{_rel_style(e['rel'])}-->[/]")
-
-        out_edges = data["outgoing"]
-        if out_edges:
-            lines.append("")
-            lines.append(f"[bold]Outgoing[/] ({len(out_edges)})")
-            for e in out_edges:
-                lines.append(f"  [dim]--{_rel_style(e['rel'])}-->[/] {e['target']}")
-
-        if coupling_only:
-            hidden = data.get("hidden_rels", {})
-            hidden_in = hidden.get("incoming", 0)
-            hidden_out = hidden.get("outgoing", 0)
-            hidden_total = hidden_in + hidden_out
-            if hidden_total:
+    if sys.stdout.isatty():
+        title = f"[bold]{node.name}[/]  [{_type_badge(node.type.value)}]"
+        lines: list[str] = []
+        if loc:
+            lines.append(f"[dim]file:[/]  {loc}")
+        if node.docstring:
+            lines.append(f"[dim]doc:[/]   {node.docstring.split(chr(10))[0]}")
+        if node.metadata:
+            for k, v in sorted(node.metadata.items()):
+                lines.append(f"[dim]{k}:[/]  {v}")
+        if depth >= 1:
+            cpath = data["containment_path"]
+            if len(cpath) > 1:
                 lines.append("")
-                lines.append(
-                    f"[dim]{hidden_total} hidden non-coupling edge(s); rerun with --all-rels to include them[/]"
-                )
-
-    if depth >= 2:
-        neighbors = data["neighbors"]
-        if neighbors:
-            lines.append("")
-            lines.append(f"[bold]Neighborhood[/] ({len(neighbors)} nodes within 2 hops)")
-            for n in neighbors[:20]:
-                nnode = graph.get_node(n)
-                t = nnode.type.value if nnode else "?"
-                lines.append(f"  [{_type_badge(t)}] {n}")
-            if len(neighbors) > 20:
-                lines.append(f"  [dim]... and {len(neighbors) - 20} more[/]")
-
-    console.print(Panel("\n".join(lines), title=title, border_style="dim"))
+                lines.append(f"[bold]Path:[/] {' > '.join(cpath)}")
+            inc_edges = data["incoming"]
+            if inc_edges:
+                lines.append("")
+                lines.append(f"[bold]Incoming[/] ({len(inc_edges)})")
+                show_inc = inc_edges if edge_cap == 0 else inc_edges[:edge_cap]
+                for e in show_inc:
+                    lines.append(f"  {e['source']} [dim]--{_rel_style(e['rel'])}-->[/]")
+                if edge_cap and len(inc_edges) > edge_cap:
+                    lines.append(f"  [dim]... and {len(inc_edges) - edge_cap} more (use --full)[/]")
+            out_edges = data["outgoing"]
+            if out_edges:
+                lines.append("")
+                lines.append(f"[bold]Outgoing[/] ({len(out_edges)})")
+                show_out = out_edges if edge_cap == 0 else out_edges[:edge_cap]
+                for e in show_out:
+                    lines.append(f"  [dim]--{_rel_style(e['rel'])}-->[/] {e['target']}")
+                if edge_cap and len(out_edges) > edge_cap:
+                    lines.append(f"  [dim]... and {len(out_edges) - edge_cap} more (use --full)[/]")
+            if coupling_only:
+                hidden = data.get("hidden_rels", {})
+                hidden_total = hidden.get("incoming", 0) + hidden.get("outgoing", 0)
+                if hidden_total:
+                    lines.append("")
+                    lines.append(
+                        f"[dim]{hidden_total} hidden non-coupling edge(s); rerun with --all-rels to include them[/]"
+                    )
+        if depth >= 2:
+            neighbors = data["neighbors"]
+            if neighbors:
+                neighbor_cap = 0 if full else 10
+                lines.append("")
+                lines.append(f"[bold]Neighborhood[/] ({len(neighbors)} nodes within 2 hops)")
+                show_neighbors = neighbors if neighbor_cap == 0 else neighbors[:neighbor_cap]
+                for n in show_neighbors:
+                    nnode = graph.get_node(n)
+                    t = nnode.type.value if nnode else "?"
+                    lines.append(f"  [{_type_badge(t)}] {n}")
+                if neighbor_cap and len(neighbors) > neighbor_cap:
+                    lines.append(f"  [dim]... and {len(neighbors) - neighbor_cap} more (use --full)[/]")
+        console.print(Panel("\n".join(lines), title=title, border_style="dim"))
+    else:
+        # Plain ASCII for piped output
+        click.echo(f"{node.name}  [{node.type.value}]")
+        if loc:
+            click.echo(f"file:  {loc}")
+        if node.docstring:
+            click.echo(f"doc:   {node.docstring.split(chr(10))[0]}")
+        if node.metadata:
+            for k, v in sorted(node.metadata.items()):
+                click.echo(f"{k}:  {v}")
+        if depth >= 1:
+            cpath = data["containment_path"]
+            if len(cpath) > 1:
+                click.echo(f"\nPath: {' > '.join(cpath)}")
+            inc_edges = data["incoming"]
+            if inc_edges:
+                click.echo(f"\nIncoming ({len(inc_edges)})")
+                show_inc = inc_edges if edge_cap == 0 else inc_edges[:edge_cap]
+                for e in show_inc:
+                    click.echo(f"  {e['source']} --{e['rel']}-->")
+                if edge_cap and len(inc_edges) > edge_cap:
+                    click.echo(f"  ... and {len(inc_edges) - edge_cap} more (use --full)")
+            out_edges = data["outgoing"]
+            if out_edges:
+                click.echo(f"\nOutgoing ({len(out_edges)})")
+                show_out = out_edges if edge_cap == 0 else out_edges[:edge_cap]
+                for e in show_out:
+                    click.echo(f"  --{e['rel']}--> {e['target']}")
+                if edge_cap and len(out_edges) > edge_cap:
+                    click.echo(f"  ... and {len(out_edges) - edge_cap} more (use --full)")
+            if coupling_only:
+                hidden = data.get("hidden_rels", {})
+                hidden_total = hidden.get("incoming", 0) + hidden.get("outgoing", 0)
+                if hidden_total:
+                    click.echo(f"\n{hidden_total} hidden non-coupling edge(s); rerun with --all-rels to include them")
+        if depth >= 2:
+            neighbors = data["neighbors"]
+            if neighbors:
+                neighbor_cap = 0 if full else 10
+                click.echo(f"\nNeighborhood ({len(neighbors)} nodes within 2 hops)")
+                show_neighbors = neighbors if neighbor_cap == 0 else neighbors[:neighbor_cap]
+                for n in show_neighbors:
+                    nnode = graph.get_node(n)
+                    t = nnode.type.value if nnode else "?"
+                    click.echo(f"  [{t}] {n}")
+                if neighbor_cap and len(neighbors) > neighbor_cap:
+                    click.echo(f"  ... and {len(neighbors) - neighbor_cap} more (use --full)")
 
 
 @main.command()
@@ -172,9 +227,10 @@ def about(name: str, depth: int, fmt: str | None, coupling_only: bool) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def usages(name: str, rel: str | None, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def usages(name: str, rel: str | None, fmt: str | None, limit_: int) -> None:
     """Where is X used? Every direct reference with source location.
 
     Shows all nodes that reference X via coupling edges (calls, imports,
@@ -227,24 +283,40 @@ def usages(name: str, rel: str | None, fmt: str | None) -> None:
         return
 
     if not usage_list:
-        console.print(f"[bold]{name}[/]: [dim]no usages found[/]")
+        if sys.stdout.isatty():
+            console.print(f"[bold]{name}[/]: [dim]no usages found[/]")
+        else:
+            click.echo(f"{name}: no usages found")
         return
 
-    console.print(f"[bold]Usages of[/] {name} ({len(usage_list)}):\n")
-    table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
-    table.add_column("Rel", style="dim", width=10)
-    table.add_column("Node", style="bold")
-    table.add_column("File", style="dim")
+    total = len(usage_list)
+    display = usage_list if limit_ == 0 else usage_list[:limit_]
 
-    for u in usage_list:
+    rows: list[list[str]] = []
+    for u in display:
         loc = u.get("file", "")
         if "line" in u:
             loc += f":{u['line']}"
             if "end_line" in u and u["end_line"] != u["line"]:
                 loc += f"-{u['end_line']}"
-        table.add_row(_rel_style(u["rel"]), u["node"], loc)
+        rows.append([u["rel"], u["node"], loc])
 
-    console.print(table)
+    if sys.stdout.isatty():
+        console.print(f"[bold]Usages of[/] {name} ({total}):\n")
+        table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+        table.add_column("Rel", style="dim", width=10)
+        table.add_column("Node", style="bold")
+        table.add_column("File", style="dim")
+        for row in rows:
+            table.add_row(_rel_style(row[0]), row[1], row[2])
+        console.print(table)
+        if limit_ > 0 and total > limit_:
+            console.print(f"[dim](showing {limit_} of {total} -- use --limit 0 or --format json for all)[/]")
+    else:
+        click.echo(f"Usages of {name} ({total}):\n")
+        click.echo(_compact_table(rows, ["Rel", "Node", "File"], limit=0, total=total))
+        if limit_ > 0 and total > limit_:
+            click.echo(f"(showing {limit_} of {total} -- use --limit 0 or --format json for all)")
 
 
 @main.command()
@@ -255,14 +327,15 @@ def usages(name: str, rel: str | None, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 @click.option(
     "--coupling-only/--all-rels",
     default=True,
     help="Follow only architecture-significant coupling edges by default",
 )
-def impact(name: str, depth: int | None, fmt: str | None, coupling_only: bool) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def impact(name: str, depth: int | None, fmt: str | None, coupling_only: bool, limit_: int) -> None:
     """What breaks if I change X? Reverse transitive impact analysis.
 
     Follows incoming coupling edges transitively by default to find the nodes
@@ -298,12 +371,17 @@ def impact(name: str, depth: int | None, fmt: str | None, coupling_only: bool) -
         console.print(f"[bold]{name}[/]: [dim]no upstream dependents[/]")
         return
 
+    total = len(affected)
+    display = affected if limit_ == 0 else affected[:limit_]
+
     console.print(f"[bold]Impact of changing[/] {name}:")
-    for a in affected:
+    for a in display:
         anode = graph.get_node(a)
         t = anode.type.value if anode else "?"
         console.print(f"  [{_type_badge(t)}] {a}")
-    console.print(f"\n[dim]{len(affected)} node(s) affected[/]")
+    if limit_ > 0 and total > limit_:
+        console.print(f"[dim](showing {limit_} of {total} -- use --limit 0 or --format json for all)[/]")
+    console.print(f"\n[dim]{total} node(s) affected[/]")
 
 
 @main.command()
@@ -314,7 +392,7 @@ def impact(name: str, depth: int | None, fmt: str | None, coupling_only: bool) -
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def between(a: str, b: str, fmt: str | None) -> None:
     """How do A and B relate? Shortest path + direct edges.
@@ -369,7 +447,7 @@ def between(a: str, b: str, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def overview(top_n: int, fmt: str | None) -> None:
     """Orient me. High-level summary of the graph.
@@ -423,40 +501,49 @@ def overview(top_n: int, fmt: str | None) -> None:
         )
         return
 
-    # Rich text
-    console.print(f"[bold]Graph:[/] {len(nodes)} nodes, {len(edges)} edges\n")
+    conn_rows = [
+        [c["name"], c["type"], str(c["incoming"]), str(c["outgoing"]), str(c["total"])] for c in connectivity[:top_n]
+    ]
+    mod_rows = [[m["name"], m["type"], str(m["children"])] for m in modules[:top_n]]
 
-    # Top connected
-    table = Table(
-        title=f"[bold]Most Connected[/] (top {top_n})",
-        border_style="dim",
-        pad_edge=False,
-    )
-    table.add_column("Name", style="bold")
-    table.add_column("Type", style="dim")
-    table.add_column("In", justify="right")
-    table.add_column("Out", justify="right")
-    table.add_column("Total", justify="right", style="bold")
-    for c in connectivity[:top_n]:
-        table.add_row(
-            c["name"],
-            _type_badge(c["type"]),
-            str(c["incoming"]),
-            str(c["outgoing"]),
-            str(c["total"]),
+    if sys.stdout.isatty():
+        console.print(f"[bold]Graph:[/] {len(nodes)} nodes, {len(edges)} edges\n")
+
+        table = Table(
+            title=f"[bold]Most Connected[/] (top {top_n})",
+            border_style="dim",
+            pad_edge=False,
         )
-    console.print(table)
+        table.add_column("Name", style="bold")
+        table.add_column("Type", style="dim")
+        table.add_column("In", justify="right")
+        table.add_column("Out", justify="right")
+        table.add_column("Total", justify="right", style="bold")
+        for row in conn_rows:
+            table.add_row(row[0], _type_badge(row[1]), row[2], row[3], row[4])
+        console.print(table)
 
-    # Modules
-    if modules:
-        console.print()
-        mod_table = Table(title="[bold]Modules[/]", border_style="dim", pad_edge=False)
-        mod_table.add_column("Name", style="bold")
-        mod_table.add_column("Type", style="dim")
-        mod_table.add_column("Children", justify="right")
-        for m in modules:
-            mod_table.add_row(m["name"], _type_badge(m["type"]), str(m["children"]))
-        console.print(mod_table)
+        if mod_rows:
+            console.print()
+            mod_table = Table(title=f"[bold]Modules[/] (top {top_n})", border_style="dim", pad_edge=False)
+            mod_table.add_column("Name", style="bold")
+            mod_table.add_column("Type", style="dim")
+            mod_table.add_column("Children", justify="right")
+            for row in mod_rows:
+                mod_table.add_row(row[0], _type_badge(row[1]), row[2])
+            console.print(mod_table)
+            if len(modules) > top_n:
+                console.print(f"[dim](showing {top_n} of {len(modules)} modules -- use --top to see more)[/]")
+    else:
+        click.echo(f"Graph: {len(nodes)} nodes, {len(edges)} edges\n")
+        click.echo(f"Most Connected (top {top_n})")
+        click.echo(_compact_table(conn_rows, ["Name", "Type", "In", "Out", "Total"], limit=0))
+        if mod_rows:
+            click.echo()
+            click.echo(f"Modules (top {top_n})")
+            click.echo(_compact_table(mod_rows, ["Name", "Type", "Children"], limit=0))
+            if len(modules) > top_n:
+                click.echo(f"(showing {top_n} of {len(modules)} modules -- use --top to see more)")
 
 
 @main.command()
@@ -466,7 +553,7 @@ def overview(top_n: int, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def diff(ref: str, fmt: str | None) -> None:
     """What changed structurally? Compare graph against a git ref.
@@ -628,8 +715,9 @@ def diff(ref: str, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
+@click.option("--full", is_flag=True, help="Show all sections and full JSON (no truncation)")
 def analyze(
     top_n: int,
     module_filter: str | None,
@@ -638,6 +726,7 @@ def analyze(
     include_concepts: bool,
     churn_days: int,
     fmt: str | None,
+    full: bool,
 ) -> None:
     """Deep architectural analysis with hotspot detection.
 
@@ -736,10 +825,15 @@ def analyze(
     if delta_names is not None:
         filter_to_delta(r, delta_names, graph)
 
+    # Text defaults to summary view; --full expands it.
+    # JSON always includes everything unless --summary is set.
+    json_summary = summary and not full
+
     if fmt == "json":
-        _render_analyze_json(r, graph, top_n, summary)
+        _render_analyze_json(r, graph, top_n, json_summary)
     else:
-        _render_analyze_text(r, graph, top_n, summary, module_filter, since_ref, delta_names)
+        text_summary = not full  # default is summary; --full overrides
+        _render_analyze_text(r, graph, top_n, text_summary, module_filter, since_ref, delta_names)
 
 
 def _render_analyze_json(r: "AnalysisResult", graph: SemGraph, top_n: int, summary: bool) -> None:
@@ -896,6 +990,75 @@ def _render_concepts_text(concepts: "ConceptAnalysis", top_n: int) -> None:
             console.print(f"  [dim]... and {len(violations) - top_n} more[/]")
 
 
+def _render_analyze_summary(
+    r: "AnalysisResult",
+    graph: SemGraph,
+    scope_label: str,
+    max_layer: int,
+    max_k: int,
+    core_members: list[str],
+) -> None:
+    """Brief one-line-per-section summary for default text output."""
+    console.print(f"[bold]Analysis[/]{scope_label} -- {r.node_count} nodes, {r.edge_count} edges")
+
+    # Hotspots: top 3
+    if r.hotspots:
+        top3 = ", ".join(h["name"] for h in r.hotspots[:3])
+        console.print(f"  [red]Hotspots[/] ({len(r.hotspots)}): {top3}")
+    else:
+        console.print("  [green]Hotspots: none[/]")
+
+    # Cycles
+    console.print(f"  [{'red' if r.cycles else 'green'}]Cycles[/]: {len(r.cycles)}")
+
+    # PageRank: top 3
+    pr_top = sorted(r.pagerank.items(), key=lambda x: x[1], reverse=True)[:3]
+    if pr_top:
+        names = ", ".join(n for n, _ in pr_top)
+        console.print(f"  [bold]PageRank[/] top 3: {names}")
+
+    # Dead code
+    console.print(f"  [{'yellow' if r.dead_code else 'green'}]Dead code[/]: {len(r.dead_code)} unreferenced")
+
+    # Layering
+    color = "yellow" if r.layering_violations else "green"
+    console.print(f"  [{color}]Layering violations[/]: {len(r.layering_violations)}")
+
+    # SDP
+    console.print(f"  [{'red' if r.sdp_violations else 'green'}]SDP violations[/]: {len(r.sdp_violations)}")
+
+    # Code smells
+    smells = r.god_classes + r.feature_envy + r.shotgun_surgery + r.god_files
+    console.print(f"  [{'red' if smells else 'green'}]Code smells[/]: {len(smells)}")
+
+    # Class metrics (count only)
+    if r.wmc:
+        console.print(f"  [bold]Classes[/]: {len(r.wmc)} analyzed")
+
+    # Module metrics (count only)
+    if r.martin:
+        console.print(f"  [bold]Modules[/]: {len(r.martin)} analyzed")
+
+    # Git churn
+    if r.churn and r.churn.entity_churn:
+        churn_top = sorted(r.churn.entity_churn.items(), key=lambda x: x[1], reverse=True)[:3]
+        names = ", ".join(n for n, _ in churn_top)
+        console.print(f"  [bold]Git churn[/] ({r.churn.total_commits} commits): {names}")
+
+    # Concepts
+    if r.concepts is not None:
+        cdata = r.concepts.to_dict()
+        declared: list[object] = cdata.get("declared", [])  # type: ignore[assignment]
+        deps: list[object] = cdata.get("dependencies", [])  # type: ignore[assignment]
+        viols: list[object] = cdata.get("violations", [])  # type: ignore[assignment]
+        console.print(f"  [bold]Concepts[/]: {len(declared)} declared, {len(deps)} deps, {len(viols)} violations")
+
+    console.print(
+        f"\n[dim]{max_layer + 1} layers | core: {len(core_members)} nodes (k={max_k})"
+        f" | {len(r.bridges)} bridges | use --full for details[/]"
+    )
+
+
 def _render_analyze_text(
     r: "AnalysisResult",
     graph: SemGraph,
@@ -918,6 +1081,11 @@ def _render_analyze_text(
     if since_ref:
         n_delta = len(delta_names) if delta_names else 0
         scope_label += f" [dim](since {since_ref}, {n_delta} changed)[/]"
+
+    if summary:
+        _render_analyze_summary(r, graph, scope_label, max_layer, max_k, core_members)
+        return
+
     console.print(f"\n[bold]Analysis[/]{scope_label} -- {r.node_count} nodes, {r.edge_count} edges")
 
     # Hotspots
@@ -1010,13 +1178,6 @@ def _render_analyze_text(
 
     if r.concepts is not None:
         _render_concepts_text(r.concepts, top_n)
-
-    if summary:
-        console.print(
-            f"\n[dim]Architecture depth: {max_layer + 1} layers | Core: {len(core_members)} nodes (k={max_k})"
-            f" | Bridges: {len(r.bridges)}[/]"
-        )
-        return
 
     # --- Full output ---
 
@@ -1148,9 +1309,10 @@ def _render_analyze_text(
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def context(name: str, tokens: int, fmt: str | None) -> None:
+@click.option("--with-source", is_flag=True, help="Include full source bodies (default: signatures only)")
+def context(name: str, tokens: int, fmt: str | None, with_source: bool) -> None:
     """Pack relevant source code for LLM context within a token budget.
 
     Walks outward from the target entity, greedily packing source code by
@@ -1172,7 +1334,7 @@ def context(name: str, tokens: int, fmt: str | None) -> None:
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
 
-    result = build_context(graph, root, name, budget=tokens)
+    result = build_context(graph, root, name, budget=tokens, with_source=with_source)
 
     if fmt == "json":
         data = {
@@ -1231,7 +1393,7 @@ def context(name: str, tokens: int, fmt: str | None) -> None:
             console.print(f"  [dim]{entry.content}[/]\n")
 
     if result.truncated:
-        console.print("[yellow]Budget exhausted[/] — some neighbors omitted or downgraded")
+        console.print("[yellow]Budget exhausted[/] -- some neighbors omitted or downgraded")
 
 
 @main.command()
@@ -1241,9 +1403,10 @@ def context(name: str, tokens: int, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def blame(name: str, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def blame(name: str, fmt: str | None, limit_: int) -> None:
     """Who last touched this entity? Entity-level git blame.
 
     Accepts a node name or a file path. If a node name is given, blames that
@@ -1295,26 +1458,49 @@ def blame(name: str, fmt: str | None) -> None:
             click.echo(json_mod.dumps(data, indent=2))
             return
 
-        console.print(f"[bold]Blame for[/] {name}\n")
-        table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
-        table.add_column("Lines", style="dim", width=10)
-        table.add_column("Entity", style="bold")
-        table.add_column("Type")
-        table.add_column("Commit", style="dim", width=12)
-        table.add_column("Author")
-        table.add_column("Date", style="dim")
-        table.add_column("Summary")
+        total = len(entries)
+        rows: list[list[str]] = []
         for e in entries:
-            table.add_row(
-                f"{e.line}-{e.end_line}",
-                e.name,
-                _type_badge(e.node_type),
-                e.commit,
-                e.author,
-                e.date,
-                e.summary,
+            rows.append(
+                [
+                    f"{e.line}-{e.end_line}",
+                    e.name,
+                    e.node_type,
+                    e.commit or "",
+                    e.author or "",
+                    e.date or "",
+                    e.summary or "",
+                ]
             )
-        console.print(table)
+
+        if sys.stdout.isatty():
+            display = entries if limit_ == 0 else entries[:limit_]
+            console.print(f"[bold]Blame for[/] {name}\n")
+            table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
+            table.add_column("Lines", style="dim", width=10)
+            table.add_column("Entity", style="bold")
+            table.add_column("Type")
+            table.add_column("Commit", style="dim", width=12)
+            table.add_column("Author")
+            table.add_column("Date", style="dim")
+            table.add_column("Summary")
+            for e in display:
+                table.add_row(
+                    f"{e.line}-{e.end_line}",
+                    e.name,
+                    _type_badge(e.node_type),
+                    e.commit,
+                    e.author,
+                    e.date,
+                    e.summary,
+                )
+            console.print(table)
+            if limit_ > 0 and total > limit_:
+                console.print(f"[dim](showing {limit_} of {total} -- use --limit 0 or --format json for all)[/]")
+        else:
+            cols = ["Lines", "Entity", "Type", "Commit", "Author", "Date", "Summary"]
+            click.echo(f"Blame for {name}\n")
+            click.echo(_compact_table(rows, cols, limit=limit_, total=total))
     else:
         resolved = _resolve_or_exit(graph, name)
         node = graph.get_node(resolved)
@@ -1348,3 +1534,155 @@ def blame(name: str, fmt: str | None) -> None:
         console.print(f"  [dim]{entry.file}:{entry.line}-{entry.end_line}[/]")
         console.print(f"  [bold]{entry.commit}[/] {entry.author} [dim]({entry.date})[/]")
         console.print(f"  {entry.summary}")
+
+
+# --- Search ---
+
+_SEARCH_LIMIT = 10
+
+_SEARCH_COLUMNS: list[tuple[str, str, dict]] = [
+    ("rank", "rank", {"align": "right", "max_width": 6}),
+    ("kind", "kind", {"max_width": 12}),
+    ("name", "name", {"max_width": 40}),
+    ("location", "location", {"max_width": 30}),
+    ("snippet", "snippet", {"max_width": 40}),
+]
+
+
+@main.command()
+@click.argument("query_str", metavar="QUERY")
+@click.option("--kind", "kind_", default=None, help="Filter by node kind (post-match)")
+@click.option("--limit", "limit_", default=_SEARCH_LIMIT, type=int, help="Max results (0 = unlimited, default 10)")
+@click.option("--json", "use_json", is_flag=True, help="Emit canonical JSON envelope")
+@click.option(
+    "--format",
+    "fmt",
+    default=None,
+    type=click.Choice(["text", "json"]),
+    hidden=True,
+    help="Output format (hidden, use --json instead)",
+)
+@click.option("--full", is_flag=True, help="Show expanded detail per hit")
+@click.option("--json-legacy", "json_legacy", is_flag=True, hidden=True, help="Emit bare JSON array (legacy)")
+def search(
+    query_str: str,
+    kind_: str | None,
+    limit_: int,
+    use_json: bool,
+    fmt: str | None,
+    full: bool,
+    json_legacy: bool,
+) -> None:
+    """Fuzzy-search the code graph by identifier or docstring.
+
+    \b
+    Uses FTS5 full-text search over identifier tokens and docstrings.
+    Dotted names are automatically split: smg.cli.helpers._truncate
+    matches as if you searched "smg cli helpers truncate".
+
+    \b
+    Default ordering: best relevance first (BM25).
+    """
+    import json as json_mod
+
+    from smg.cli._compact import compact_json_envelope, compact_table
+    from smg.search import search_nodes
+    from smg.search.schema import search_db_path
+
+    graph, root = _load()
+    db_path = search_db_path(root)
+
+    # Auto-rebuild if missing
+    if not db_path.exists():
+        from smg.search import rebuild_search_index
+
+        rebuild_search_index(graph, root)
+
+    effective_json = use_json or fmt == "json"
+
+    hits, total = search_nodes(
+        db_path,
+        query_str,
+        kind=kind_,
+        limit=limit_,
+        graph=graph,
+        root=root,
+    )
+
+    if json_legacy:
+        data = [
+            {
+                "name": h.name,
+                "kind": h.kind,
+                "file": h.file,
+                "line_start": h.line_start,
+                "score": h.score,
+            }
+            for h in hits
+        ]
+        click.echo(json_mod.dumps(data, indent=2))
+        return
+
+    rows: list[dict[str, object]] = []
+    for h in hits:
+        row: dict[str, object] = {
+            "rank": h.rank,
+            "kind": h.kind,
+            "name": h.name,
+            "location": h.location,
+            "snippet": h.snippet,
+        }
+        if full and effective_json:
+            row["extra"] = {
+                "file": h.file,
+                "line_start": h.line_start,
+                "line_end": h.line_end,
+                "docstring": h.docstring,
+                "score": h.score,
+            }
+        rows.append(row)
+
+    if effective_json:
+        envelope = compact_json_envelope(
+            rows,
+            _SEARCH_COLUMNS,
+            total=total,
+            limit=limit_,
+        )
+        click.echo(json_mod.dumps(envelope, indent=2))
+        return
+
+    if not hits:
+        click.echo("No results.")
+        return
+
+    if full:
+        # Expanded multi-line view
+        for h in hits:
+            click.echo(f"{h.rank}. [{h.kind}] {h.name}")
+            click.echo(f"   {h.location}")
+            if h.docstring:
+                for line in h.docstring.split("\n")[:5]:
+                    click.echo(f"   {line}")
+            click.echo()
+        if total > len(hits):
+            click.echo(f"(showing {len(hits)} of {total} \u2014 use --limit 0 for all, --json for machine-readable)")
+        return
+
+    displayed_total = total if total > len(rows) else None
+    click.echo(compact_table(rows, _SEARCH_COLUMNS, total=displayed_total))
+
+
+@main.command()
+def index() -> None:
+    """Rebuild the search index from the current graph.
+
+    Equivalent to running smg scan with no new sources. Useful when the
+    search cache has been deleted or corrupted.
+    """
+    from smg.search import rebuild_search_index
+
+    graph, root = _load()
+    rebuild_search_index(graph, root)
+    node_count = len(graph.all_nodes())
+    console.print(f"[green]Indexed[/] {node_count} nodes into search cache")

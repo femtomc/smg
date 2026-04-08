@@ -378,13 +378,12 @@ def test_scan_cli(tmp_path):
 
     runner = CliRunner()
     runner.invoke(main, ["init"])
-    result = runner.invoke(main, ["scan", "src/"])
+    result = runner.invoke(main, ["scan", "src/", "--format", "json"])
     assert result.exit_code == 0
-    # Auto-format: JSON in non-TTY
     data = json.loads(result.output)
     assert data["files"] == 3
 
-    result = runner.invoke(main, ["list", "--type", "class"])
+    result = runner.invoke(main, ["list", "--type", "class", "--json-legacy"])
     nodes = json.loads(result.output)
     names = [n["name"] for n in nodes]
     assert "mylib.core.Base" in names

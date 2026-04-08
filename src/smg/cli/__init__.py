@@ -51,6 +51,8 @@ click.rich_click.COMMAND_GROUPS = {
                 "analyze",
                 "context",
                 "blame",
+                "search",
+                "index",
             ],
         },
         {"name": "Enforce", "commands": ["rule", "concept", "check"]},
@@ -134,10 +136,44 @@ def _scope_graph(graph: SemGraph, module_filter: str, fmt: str | None = None) ->
 
 
 def _auto_fmt(explicit: str | None) -> str:
-    """Auto-detect output format: JSON when piped, rich text in terminal."""
+    """Return the output format.  Always defaults to text."""
     if explicit is not None:
         return explicit
-    return "text" if sys.stdout.isatty() else "json"
+    return "text"
+
+
+# --- Compact table helper ---
+
+_DEFAULT_LIMIT = 20
+
+
+def _compact_table(
+    rows: list[list[str]],
+    columns: list[str],
+    *,
+    limit: int = _DEFAULT_LIMIT,
+    total: int | None = None,
+) -> str:
+    """Compat shim: delegates to the canonical compact_table() from _compact.py.
+
+    Accepts the old (list-of-lists, list-of-headers) API and converts to
+    the new (list-of-dicts, list-of-Column-tuples) API.
+    """
+    from smg.cli._compact import compact_table
+
+    # Convert list-of-lists to list-of-dicts
+    col_specs: list[tuple[str, str, dict]] = [(c.lower(), c.lower(), {}) for c in columns]
+    keys = [c.lower() for c in columns]
+    display = rows[:limit] if limit > 0 else rows
+    dict_rows: list[dict[str, object]] = []
+    for row in display:
+        d: dict[str, object] = {}
+        for i, k in enumerate(keys):
+            d[k] = row[i] if i < len(row) else ""
+        dict_rows.append(d)
+
+    effective_total = total if total is not None and total > len(dict_rows) else None
+    return compact_table(dict_rows, col_specs, total=effective_total)
 
 
 def _parse_meta(meta: tuple[str, ...]) -> dict[str, str]:
@@ -210,7 +246,7 @@ def main() -> None:
       smg about MyClass     # ask questions
       smg analyze           # deep architectural analysis
 
-    Output is automatically JSON when piped, rich text in terminal.
+    Default output is compact text.  Use --format json for structured data.
     """
     pass
 
@@ -218,7 +254,9 @@ def main() -> None:
 # --- Output helpers ---
 
 
-def _output_names(names: list[str], title: str, fmt: str, graph: SemGraph, center: str) -> None:
+def _output_names(
+    names: list[str], title: str, fmt: str, graph: SemGraph, center: str, *, limit: int = _DEFAULT_LIMIT
+) -> None:
     if fmt == "json":
         import json
 
@@ -243,9 +281,13 @@ def _output_names(names: list[str], title: str, fmt: str, graph: SemGraph, cente
         if not names:
             console.print(f"[bold]{title}:[/] [dim](none)[/]")
         else:
+            total = len(names)
+            display = names if limit == 0 else names[:limit]
             console.print(f"[bold]{title}:[/]")
-            for n in names:
+            for n in display:
                 console.print(f"  {n}")
+            if limit > 0 and total > limit:
+                console.print(f"[dim](showing {limit} of {total} -- use --limit 0 or --format json for all)[/]")
 
 
 def _output_graph(graph: SemGraph, fmt: str) -> None:
@@ -259,7 +301,7 @@ def _output_graph(graph: SemGraph, fmt: str) -> None:
         click.echo(export.to_text(graph))
 
 
-def _output_edges(edges: list[Edge], fmt: str) -> None:
+def _output_edges(edges: list[Edge], fmt: str, *, limit: int = _DEFAULT_LIMIT) -> None:
     if fmt == "json":
         import json
 
@@ -271,8 +313,12 @@ def _output_edges(edges: list[Edge], fmt: str) -> None:
         if not edges:
             console.print("[dim](none)[/]")
         else:
-            for e in edges:
+            total = len(edges)
+            display = edges if limit == 0 else edges[:limit]
+            for e in display:
                 console.print(f"  {e.source} [dim]--{_rel_style(e.rel.value)}-->[/] {e.target}")
+            if limit > 0 and total > limit:
+                console.print(f"[dim](showing {limit} of {total} -- use --limit 0 or --format json for all)[/]")
 
 
 # Import submodules to register commands on `main`

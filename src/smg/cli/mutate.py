@@ -73,6 +73,9 @@ def add(
     )
     graph.add_node(node)
     save_graph(graph, root)
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
     console.print(f"[green]Added[/] [{_type_badge(type)}] [bold]{name}[/]")
 
 
@@ -105,6 +108,9 @@ def link(source: str, rel: str, target: str, meta: tuple[str, ...]) -> None:
         err_console.print(f"[red]Error:[/] {e}")
         sys.exit(EXIT_NOT_FOUND)
     save_graph(graph, root)
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
     console.print(f"[green]Linked[/] {source} [dim]--{_rel_style(rel)}-->[/] {target}")
 
 
@@ -123,6 +129,9 @@ def rm(name: str) -> None:
         err_console.print(f"[red]Error:[/] {e}")
         sys.exit(EXIT_NOT_FOUND)
     save_graph(graph, root)
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
     console.print(f"[red]Removed[/] {name}")
 
 
@@ -145,6 +154,9 @@ def unlink(source: str, rel: str, target: str) -> None:
         err_console.print(f"[red]Error:[/] {e}")
         sys.exit(EXIT_NOT_FOUND)
     save_graph(graph, root)
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
     console.print(f"[red]Unlinked[/] {source} [dim]--{rel}-->[/] {target}")
 
 
@@ -183,6 +195,9 @@ def update(
     if meta:
         node.metadata.update(_parse_meta(meta))
     save_graph(graph, root)
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
     console.print(f"[green]Updated[/] [bold]{name}[/]")
 
 
@@ -209,7 +224,7 @@ def update(
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def scan(
     paths: tuple[str, ...],
@@ -314,6 +329,10 @@ def scan(
         progress_ctx.stop()
 
     save_graph(graph, root)
+
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
 
     if fmt == "json":
         import json
@@ -442,7 +461,7 @@ def watch(paths: tuple[str, ...], debounce: float) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def batch(fmt: str | None) -> None:
     """Execute JSONL commands from stdin in one load/save cycle.
@@ -561,6 +580,10 @@ def batch(fmt: str | None) -> None:
             stats["ops"].append({"line": line_no, "error": str(e)})
 
     save_graph(graph, root)
+
+    from smg.search import rebuild_search_index
+
+    rebuild_search_index(graph, root)
 
     if fmt == "json":
         click.echo(json_mod.dumps(stats, indent=2))

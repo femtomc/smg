@@ -3,11 +3,10 @@ from __future__ import annotations
 import sys
 
 import rich_click as click
-from rich.panel import Panel
-from rich.table import Table
 
 from smg import export, query
 from smg.cli import (
+    _DEFAULT_LIMIT,
     EXIT_NOT_FOUND,
     EXIT_VALIDATION,
     _auto_fmt,
@@ -15,13 +14,13 @@ from smg.cli import (
     _output_edges,
     _output_graph,
     _output_names,
-    _rel_style,
     _resolve_or_exit,
     _type_badge,
     console,
     err_console,
     main,
 )
+from smg.graph import SemGraph
 
 
 @main.command()
@@ -31,9 +30,12 @@ from smg.cli import (
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    hidden=True,
+    help="Output format (hidden, use --json instead)",
 )
-def show(name: str, fmt: str | None) -> None:
+@click.option("--json", "use_json", is_flag=True, help="Emit JSON detail")
+@click.option("--full", is_flag=True, help="Show all edges (no truncation)")
+def show(name: str, fmt: str | None, use_json: bool, full: bool) -> None:
     """Show a node's details, connections, and metrics.
 
     Short names work: [bold]smg show SemGraph[/] resolves if unambiguous.
@@ -46,41 +48,46 @@ def show(name: str, fmt: str | None) -> None:
     inc = graph.incoming(name)
     out = graph.outgoing(name)
 
-    fmt = _auto_fmt(fmt)
-    if fmt == "json":
+    effective_json = use_json or (fmt == "json" if fmt else False)
+    if effective_json:
         click.echo(export.format_node(node, inc, out, fmt="json"))
         return
 
-    # Rich panel display
-    title = f"[bold]{node.name}[/]  [{_type_badge(node.type.value)}]"
-    lines: list[str] = []
+    edge_limit = 0 if full else _DEFAULT_LIMIT
+
+    # Plain text record view (no box-drawing, no ANSI, identical in TTY and pipe)
+    click.echo(f"{node.name}  [{node.type.value}]")
     if node.file:
         loc = node.file
         if node.line is not None:
             loc += f":{node.line}"
             if node.end_line is not None and node.end_line != node.line:
                 loc += f"-{node.end_line}"
-        lines.append(f"[dim]file:[/]  {loc}")
+        click.echo(f"file:  {loc}")
     if node.docstring:
         doc = node.docstring.split("\n")[0]
-        lines.append(f"[dim]doc:[/]   {doc}")
+        click.echo(f"doc:   {doc}")
     if node.metadata:
         for k, v in sorted(node.metadata.items()):
-            lines.append(f"[dim]{k}:[/]  {v}")
+            click.echo(f"{k}:  {v}")
 
     if inc:
-        lines.append("")
-        lines.append(f"[bold]Incoming[/] ({len(inc)})")
-        for e in inc:
-            lines.append(f"  {e.source} [dim]--{_rel_style(e.rel.value)}-->[/] {node.name}")
+        click.echo("")
+        click.echo(f"Incoming ({len(inc)})")
+        show_inc = inc if edge_limit == 0 else inc[:edge_limit]
+        for e in show_inc:
+            click.echo(f"  {e.source} --{e.rel.value}--> {node.name}")
+        if edge_limit and len(inc) > edge_limit:
+            click.echo(f"  ... and {len(inc) - edge_limit} more (use --full)")
 
     if out:
-        lines.append("")
-        lines.append(f"[bold]Outgoing[/] ({len(out)})")
-        for e in out:
-            lines.append(f"  {node.name} [dim]--{_rel_style(e.rel.value)}-->[/] {e.target}")
-
-    console.print(Panel("\n".join(lines), title=title, border_style="dim"))
+        click.echo("")
+        click.echo(f"Outgoing ({len(out)})")
+        show_out = out if edge_limit == 0 else out[:edge_limit]
+        for e in show_out:
+            click.echo(f"  {node.name} --{e.rel.value}--> {e.target}")
+        if edge_limit and len(out) > edge_limit:
+            click.echo(f"  ... and {len(out) - edge_limit} more (use --full)")
 
 
 @main.command("list")
@@ -90,9 +97,14 @@ def show(name: str, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    hidden=True,
+    help="Output format (hidden, use --json instead)",
 )
-def list_nodes(type_: str | None, fmt: str | None) -> None:
+@click.option("--json", "use_json", is_flag=True, help="Emit canonical JSON envelope")
+@click.option("--json-legacy", "json_legacy", is_flag=True, hidden=True, help="Emit bare JSON array (legacy)")
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+@click.option("--full", is_flag=True, help="Show expanded detail per node")
+def list_nodes(type_: str | None, fmt: str | None, use_json: bool, json_legacy: bool, limit_: int, full: bool) -> None:
     """List all nodes in the graph.
 
     \b
@@ -100,30 +112,32 @@ def list_nodes(type_: str | None, fmt: str | None) -> None:
     Valid types: package, module, class, function, method, interface,
                  variable, constant, type, endpoint, config
     """
+    import json as json_mod
+
+    from smg.cli._compact import compact_json_envelope, compact_table
+
     graph, _root = _load()
     nodes = graph.all_nodes(type=type_)
-    fmt = _auto_fmt(fmt)
+    effective_json = use_json or fmt == "json"
 
-    if fmt == "json":
-        import json
-
+    if json_legacy:
         data = [n.to_dict() for n in nodes]
         for d in data:
             d.pop("kind", None)
-        click.echo(json.dumps(data, indent=2))
+        click.echo(json_mod.dumps(data, indent=2))
         return
 
-    if not nodes:
-        console.print("[dim]No nodes.[/]")
-        return
+    total = len(nodes)
+    display = nodes if limit_ == 0 else nodes[:limit_]
 
-    table = Table(show_header=True, header_style="bold", border_style="dim", pad_edge=False)
-    table.add_column("Type", style="dim", width=10)
-    table.add_column("Name", style="bold")
-    table.add_column("File", style="dim")
-    table.add_column("Doc", style="dim", max_width=40, overflow="ellipsis")
+    list_columns: list[tuple[str, str, dict]] = [
+        ("type", "type", {"max_width": 12}),
+        ("name", "name", {"max_width": 40}),
+        ("file", "file", {"max_width": 40}),
+    ]
 
-    for node in nodes:
+    rows: list[dict[str, object]] = []
+    for node in display:
         loc = ""
         if node.file:
             loc = node.file
@@ -131,10 +145,19 @@ def list_nodes(type_: str | None, fmt: str | None) -> None:
                 loc += f":{node.line}"
                 if node.end_line is not None and node.end_line != node.line:
                     loc += f"-{node.end_line}"
-        doc = (node.docstring or "").split("\n")[0][:40]
-        table.add_row(_type_badge(node.type.value), node.name, loc, doc)
+        rows.append({"type": node.type.value, "name": node.name, "file": loc})
 
-    console.print(table)
+    if effective_json:
+        envelope = compact_json_envelope(rows, list_columns, total=total, limit=limit_)
+        click.echo(json_mod.dumps(envelope, indent=2))
+        return
+
+    if not nodes:
+        click.echo("No nodes.")
+        return
+
+    displayed_total = total if total > len(rows) else None
+    click.echo(compact_table(rows, list_columns, total=displayed_total))
 
 
 @main.command()
@@ -143,14 +166,21 @@ def list_nodes(type_: str | None, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    hidden=True,
+    help="Output format (hidden, use --json instead)",
 )
-def status(fmt: str | None) -> None:
+@click.option("--json", "use_json", is_flag=True, help="Emit JSON summary")
+@click.option("--full", is_flag=True, help="Expanded detail")
+def status(fmt: str | None, use_json: bool, full: bool) -> None:
     """Show graph summary — node/edge counts broken down by type."""
+    import json as json_mod
+
+    from smg.cli._compact import compact_table
+
     graph, _root = _load()
     nodes = graph.all_nodes()
     edges = graph.all_edges()
-    fmt = _auto_fmt(fmt)
+    effective_json = use_json or (fmt == "json" if fmt else False)
 
     type_counts: dict[str, int] = {}
     for n in nodes:
@@ -159,35 +189,32 @@ def status(fmt: str | None) -> None:
     for e in edges:
         rel_counts[e.rel.value] = rel_counts.get(e.rel.value, 0) + 1
 
-    if fmt == "json":
-        import json
-
+    if effective_json:
         data = {
             "nodes": len(nodes),
             "edges": len(edges),
             "node_types": type_counts,
             "rel_types": rel_counts,
         }
-        click.echo(json.dumps(data, indent=2))
+        click.echo(json_mod.dumps(data, indent=2))
         return
 
-    # Node type table
-    node_table = Table(title=f"[bold]Nodes[/] ({len(nodes)})", border_style="dim", pad_edge=False)
-    node_table.add_column("Type", style="dim")
-    node_table.add_column("Count", justify="right")
-    for t, c in sorted(type_counts.items()):
-        node_table.add_row(_type_badge(t), str(c))
+    node_cols: list[tuple[str, str, dict]] = [
+        ("type", "type", {}),
+        ("count", "count", {"align": "right"}),
+    ]
+    edge_cols: list[tuple[str, str, dict]] = [
+        ("relationship", "relationship", {}),
+        ("count", "count", {"align": "right"}),
+    ]
+    node_rows = [{"type": t, "count": str(c)} for t, c in sorted(type_counts.items())]
+    edge_rows = [{"relationship": r, "count": str(c)} for r, c in sorted(rel_counts.items())]
 
-    # Edge type table
-    edge_table = Table(title=f"[bold]Edges[/] ({len(edges)})", border_style="dim", pad_edge=False)
-    edge_table.add_column("Relationship", style="dim")
-    edge_table.add_column("Count", justify="right")
-    for r, c in sorted(rel_counts.items()):
-        edge_table.add_row(_rel_style(r), str(c))
-
-    from rich.columns import Columns
-
-    console.print(Columns([node_table, edge_table], padding=(0, 4)))
+    click.echo(f"Nodes ({len(nodes)})")
+    click.echo(compact_table(node_rows, node_cols))
+    click.echo()
+    click.echo(f"Edges ({len(edges)})")
+    click.echo(compact_table(edge_rows, edge_cols))
 
 
 # --- Query subgroup ---
@@ -213,15 +240,16 @@ main.add_command(query_cmd, "query")
     "fmt",
     default=None,
     type=click.Choice(["text", "json", "mermaid", "dot"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def query_deps(name: str, depth: int | None, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def query_deps(name: str, depth: int | None, fmt: str | None, limit_: int) -> None:
     """Transitive dependencies of a node (follows imports/depends_on edges)."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
     deps = query.transitive_deps(graph, name, max_depth=depth)
-    _output_names(deps, f"Dependencies of {name}", fmt, graph, name)
+    _output_names(deps, f"Dependencies of {name}", fmt, graph, name, limit=limit_)
 
 
 @query_cmd.command("callers")
@@ -232,15 +260,16 @@ def query_deps(name: str, depth: int | None, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json", "mermaid", "dot"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def query_callers(name: str, depth: int | None, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def query_callers(name: str, depth: int | None, fmt: str | None, limit_: int) -> None:
     """What calls this node (transitively, follows incoming calls edges)."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
     callers = query.transitive_callers(graph, name, max_depth=depth)
-    _output_names(callers, f"Callers of {name}", fmt, graph, name)
+    _output_names(callers, f"Callers of {name}", fmt, graph, name, limit=limit_)
 
 
 @query_cmd.command("path")
@@ -251,7 +280,7 @@ def query_callers(name: str, depth: int | None, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
 def query_path(source: str, target: str, fmt: str | None) -> None:
     """Shortest path between two nodes."""
@@ -280,15 +309,63 @@ def query_path(source: str, target: str, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json", "mermaid", "dot"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def query_subgraph(name: str, depth: int, fmt: str | None) -> None:
+@click.option("--full", is_flag=True, help="Dump full subgraph (no summary)")
+@click.option("--limit", "limit_", default=None, type=int, help="Max nodes (default 10; 50 with --full; 0 = unlimited)")
+def query_subgraph(name: str, depth: int, fmt: str | None, full: bool, limit_: int | None) -> None:
     """Neighborhood around a node."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
     sub = query.subgraph(graph, name, depth=depth)
-    _output_graph(sub, fmt)
+
+    if fmt != "text":
+        _output_graph(sub, fmt)
+        return
+
+    sub_nodes = sub.all_nodes()
+    sub_edges = sub.all_edges()
+
+    if full:
+        cap = limit_ if limit_ is not None else 50
+        if cap > 0 and len(sub_nodes) > cap:
+            degrees = sorted(
+                ((n, len(sub.incoming(n.name)) + len(sub.outgoing(n.name))) for n in sub_nodes),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            keep = {n.name for n, _ in degrees[:cap]}
+            pruned = SemGraph()
+            for n, _ in degrees[:cap]:
+                pruned.add_node(n)
+            for e in sub.all_edges():
+                if e.source in keep and e.target in keep:
+                    pruned.add_edge(e)
+            _output_graph(pruned, "text")
+            click.echo(f"(showing {cap} of {len(sub_nodes)} nodes -- use --limit 0 for all)")
+        else:
+            _output_graph(sub, "text")
+        return
+
+    # Compact text summary (top N by degree)
+    effective_limit = limit_ if limit_ is not None else 10
+    console.print(f"[bold]Subgraph of[/] {name} [dim](depth={depth})[/]")
+    console.print(f"  {len(sub_nodes)} nodes, {len(sub_edges)} edges\n")
+
+    degrees_list: list[tuple[str, int]] = []
+    for n in sub_nodes:
+        d = len(sub.incoming(n.name)) + len(sub.outgoing(n.name))
+        degrees_list.append((n.name, d))
+    degrees_list.sort(key=lambda x: x[1], reverse=True)
+
+    cap = effective_limit if effective_limit > 0 else len(degrees_list)
+    for node_name, deg in degrees_list[:cap]:
+        n = sub.get_node(node_name)
+        t = n.type.value if n else "?"
+        console.print(f"  [{_type_badge(t)}] {node_name} [dim]({deg} edges)[/]")
+    if cap < len(degrees_list):
+        console.print(f"  [dim]... and {len(degrees_list) - cap} more (use --full or --limit 0)[/]")
 
 
 @query_cmd.command("incoming")
@@ -299,15 +376,16 @@ def query_subgraph(name: str, depth: int, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def query_incoming(name: str, rel: str | None, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def query_incoming(name: str, rel: str | None, fmt: str | None, limit_: int) -> None:
     """Incoming edges to a node. Filter with --rel calls, --rel imports, etc."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
     edges = graph.incoming(name, rel=rel)
-    _output_edges(edges, fmt)
+    _output_edges(edges, fmt, limit=limit_)
 
 
 @query_cmd.command("outgoing")
@@ -318,15 +396,16 @@ def query_incoming(name: str, rel: str | None, fmt: str | None) -> None:
     "fmt",
     default=None,
     type=click.Choice(["text", "json"]),
-    help="Output format (auto-detects: JSON when piped)",
+    help="Output format",
 )
-def query_outgoing(name: str, rel: str | None, fmt: str | None) -> None:
+@click.option("--limit", "limit_", default=_DEFAULT_LIMIT, type=int, help="Max rows (0 = unlimited, default 20)")
+def query_outgoing(name: str, rel: str | None, fmt: str | None, limit_: int) -> None:
     """Outgoing edges from a node. Filter with --rel calls, --rel imports, etc."""
     graph, _root = _load()
     name = _resolve_or_exit(graph, name)
     fmt = _auto_fmt(fmt)
     edges = graph.outgoing(name, rel=rel)
-    _output_edges(edges, fmt)
+    _output_edges(edges, fmt, limit=limit_)
 
 
 # --- Validate ---

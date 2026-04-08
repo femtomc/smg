@@ -40,6 +40,7 @@ def build_context(
     name: str,
     budget: int = 4000,
     token_counter: Callable[[str], int] | None = None,
+    with_source: bool = False,
 ) -> ContextResult:
     """Walk outward from `name`, packing source code greedily by proximity.
 
@@ -59,15 +60,26 @@ def build_context(
     if target_node is None:
         return ContextResult(target=name, entries=[], total_tokens=0, budget=budget, truncated=False)
 
-    # Tier 1: target full source (always)
-    target_content = _read_full_source(target_node, root) or _summary(target_node)
+    # Tier 1: target — full source when with_source, signature otherwise
+    if with_source:
+        full_src = _read_full_source(target_node, root)
+        target_content = full_src or _summary(target_node)
+        target_level = "full" if full_src else "summary"
+    else:
+        sig = _signature(target_node, root)
+        if sig:
+            target_content = sig
+            target_level = "signature"
+        else:
+            target_content = _summary(target_node)
+            target_level = "summary"
     target_tokens = count_fn(target_content)
     entries.append(
         ContextEntry(
             name=name,
             node_type=target_node.type.value,
             relation="target",
-            level="full",
+            level=target_level,
             content=target_content,
             tokens=target_tokens,
             file=target_node.file,
@@ -87,9 +99,13 @@ def build_context(
         if node is None:
             continue
 
-        content, level = _best_fit(node, root, count_fn, used, budget)
-        tokens = count_fn(content)
-        if used + tokens > budget and level == "full":
+        if with_source:
+            content, level = _best_fit(node, root, count_fn, used, budget)
+            tokens = count_fn(content)
+            if used + tokens > budget and level == "full":
+                content, level = _best_fit_at(node, root, "signature")
+                tokens = count_fn(content)
+        else:
             content, level = _best_fit_at(node, root, "signature")
             tokens = count_fn(content)
         if used + tokens > budget and level == "signature":
@@ -222,6 +238,10 @@ def _signature(node: Node, root: Path) -> str | None:
         return "\n".join(lines[start:end])
 
     result = [lines[start]]
+    stripped_start = lines[start].rstrip()
+    if stripped_start.endswith(":") or stripped_start.endswith("{"):
+        return "\n".join(result)
+
     for i in range(start + 1, min(start + 5, len(lines))):
         line = lines[i]
         result.append(line)

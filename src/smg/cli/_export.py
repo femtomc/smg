@@ -26,7 +26,11 @@ def export_cmd() -> None:
 @export_cmd.command("json")
 @click.option("--indent/--no-indent", default=False, help="Pretty print")
 def export_json(indent: bool) -> None:
-    """Export graph as JSON ({nodes: [...], edges: [...]})."""
+    """Export graph as JSON ({nodes: [...], edges: [...]}).
+
+    Outputs the full graph — for large repos this can be 10,000+ lines.
+    Use [bold]smg status[/] or [bold]smg overview[/] for summaries.
+    """
     graph, _root = _load()
     click.echo(export.to_json(graph, indent=indent))
 

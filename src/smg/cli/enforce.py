@@ -184,7 +184,8 @@ def rule_rm(name: str) -> None:
     type=click.Choice(["text", "json"]),
     help="Output format",
 )
-def check(name: str | None, fmt: str | None) -> None:
+@click.option("--full", is_flag=True, help="Show all violation witnesses (no truncation)")
+def check(name: str | None, fmt: str | None, full: bool) -> None:
     """Check architectural rules against the current graph.
 
     \b
@@ -234,6 +235,7 @@ def check(name: str | None, fmt: str | None) -> None:
         }
         click.echo(json_mod.dumps(data, indent=2))
     else:
+        witness_cap = 0 if full else 10
         for rule_obj in rules:
             violation = next((item for item in violations if item.rule_name == rule_obj.name), None)
             if violation is None:
@@ -241,10 +243,11 @@ def check(name: str | None, fmt: str | None) -> None:
                 continue
             console.print(f"[red]FAIL[/]  {rule_obj.name}: {violation.message}")
             lines = _render_violation_witnesses(violation)
-            for line in lines[:10]:
+            show_lines = lines if witness_cap == 0 else lines[:witness_cap]
+            for line in show_lines:
                 console.print(f"        {line}")
-            if len(lines) > 10:
-                console.print(f"        [dim]... and {len(lines) - 10} more[/]")
+            if witness_cap and len(lines) > witness_cap:
+                console.print(f"        [dim]... and {len(lines) - witness_cap} more (use --full)[/]")
 
     if violations:
         sys.exit(EXIT_NOT_FOUND)

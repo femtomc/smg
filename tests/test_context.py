@@ -115,7 +115,7 @@ def test_degradation_under_budget_pressure():
     result = build_context(graph, root, "app.target_func", budget=100, token_counter=lambda t: len(t))
     # With inflated tokens, some entries should be signature or summary
     levels = {e.level for e in result.entries}
-    assert "full" in levels  # target is always full
+    assert "signature" in levels  # target gets signature by default (full requires --with-source)
 
 
 def test_nonexistent_node():
