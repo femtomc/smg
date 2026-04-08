@@ -2,7 +2,9 @@
 
 Parses source code into a semantic graph of modules, classes, functions, and their relationships, then runs graph-theoretic and OO metrics to surface hotspots, track structural change across commits, and enforce design constraints.
 
-Really, this is for LM agents -- it's supposed to give them better eyes on the structure of your codebase.
+Really, this is for LM agents -- it's supposed to give them better (and more efficient) eyes on the structure of your codebase.
+
+It's not ... say, Smalltalk ... but it'll have to do for today.
 
 ## Install
 
