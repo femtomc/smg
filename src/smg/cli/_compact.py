@@ -1,4 +1,4 @@
-"""Canonical compact-table formatter (Phase 2 spec, rev 12).
+"""Canonical compact-table formatter Canonical compact-table formatter..
 
 One function, one spec. Every listing command in SMG uses this to produce
 byte-identical tabular output in pipes and TTYs.
