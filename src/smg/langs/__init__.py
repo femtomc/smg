@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -37,21 +38,15 @@ def get_extractor(extension: str) -> LanguageExtractor | None:
 
 
 def load_extractors() -> None:
-    """Import all lang modules to trigger registration. Silently skip missing grammars."""
-    # Each module catches its own ImportError if the grammar isn't installed
-    try:
-        from smg.langs import python as _  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        from smg.langs import javascript as _  # noqa: F401, F811
-    except ImportError:
-        pass
-    try:
-        from smg.langs import zig as _  # noqa: F401, F811
-    except ImportError:
-        pass
-    try:
-        from smg.langs import c as _  # noqa: F401, F811
-    except ImportError:
-        pass
+    """Import all lang modules to trigger registration, warning on failures."""
+    _extractor_modules = ("python", "javascript", "zig", "c")
+    for name in _extractor_modules:
+        try:
+            __import__(f"smg.langs.{name}")
+        except ImportError as exc:
+            print(f"smg: failed to load extractor '{name}': {exc}", file=sys.stderr)
+    if not REGISTRY:
+        print(
+            "smg: no extractors loaded — install dependencies with: uv pip install smg[scan]",
+            file=sys.stderr,
+        )
