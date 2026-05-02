@@ -1,73 +1,83 @@
 #!/usr/bin/env python3
-"""Benchmark multiprocessing vs serial scan extraction."""
+"""Compare serial and parallel `smg scan` performance on real scan paths."""
+
 from __future__ import annotations
 
-import multiprocessing as mp
+import argparse
+import statistics
 import time
 from pathlib import Path
 
-from smg.langs import REGISTRY, get_extractor, load_extractors
-from smg.scan import file_to_module_name
+from smg.graph import SemGraph
+from smg.langs import load_extractors
+from smg.scan import ScanStats, scan_paths
 from smg.storage import find_root
 
 
-def extract_one(args: tuple) -> tuple | None:
-    fpath_str, ext, rel, mod = args
-    load_extractors()
-    extractor = get_extractor(ext)
-    if extractor is None:
-        return None
-    source = Path(fpath_str).read_bytes()
-    result = extractor.extract(source, rel, mod)
-    return (
-        [(n.name, n.type.value, n.file, n.line, n.end_line, n.docstring, n.metadata) for n in result.nodes],
-        [(e.source, e.target, e.rel.value, e.metadata) for e in result.edges],
-    )
+def _scan_once(root: Path, paths: list[Path], jobs: int) -> tuple[float, ScanStats]:
+    graph = SemGraph()
+    started = time.perf_counter()
+    stats = scan_paths(graph, root, paths=paths, jobs=jobs)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    return elapsed_ms, stats
+
+
+def _bench(root: Path, paths: list[Path], jobs: int, samples: int) -> tuple[float, ScanStats]:
+    timings: list[float] = []
+    last_stats: ScanStats | None = None
+    for _ in range(samples):
+        elapsed_ms, stats = _scan_once(root, paths, jobs)
+        timings.append(elapsed_ms)
+        last_stats = stats
+    assert last_stats is not None
+    return statistics.median(timings), last_stats
+
+
+def _parse_jobs(raw: str) -> list[int]:
+    jobs = sorted({int(item.strip()) for item in raw.split(",") if item.strip()})
+    if not jobs or any(job < 1 for job in jobs):
+        raise argparse.ArgumentTypeError("jobs must be a comma-separated list of positive integers")
+    return jobs
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="*", default=["src", "tests"], help="paths to scan, relative to project root")
+    parser.add_argument("--jobs", type=_parse_jobs, default=_parse_jobs("1,2,4,8"), help="worker counts to compare")
+    parser.add_argument("--samples", type=int, default=3, help="samples per worker count")
+    args = parser.parse_args()
+
+    if args.samples < 1:
+        raise SystemExit("--samples must be at least 1")
+
     load_extractors()
     root = find_root()
-    all_files = sorted((root / "src").glob("**/*.py")) + sorted((root / "tests").glob("**/*.py"))
+    if root is None:
+        raise SystemExit("no .smg project root found")
 
-    file_infos = []
-    for f in all_files:
-        ext = f.suffix
-        rel = str(f.relative_to(root))
-        mod = file_to_module_name(rel, root)
-        file_infos.append((str(f), ext, rel, mod))
+    paths = [(root / path).resolve() for path in args.paths]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise SystemExit(f"scan path(s) not found: {', '.join(missing)}")
 
-    print(f"{len(file_infos)} files, {mp.cpu_count()} cores\n")
+    print(f"root: {root}")
+    print(f"paths: {', '.join(str(path.relative_to(root)) for path in paths)}")
+    print(f"samples: {args.samples}\n")
 
-    # Serial
-    t0 = time.perf_counter()
-    for _ in range(3):
-        for args in file_infos:
-            extract_one(args)
-    t1 = time.perf_counter()
-    serial_ms = (t1 - t0) / 3 * 1000
-    print(f"Serial:            {serial_ms:.1f} ms")
+    rows: list[tuple[int, float, ScanStats]] = []
+    for jobs in args.jobs:
+        elapsed_ms, stats = _bench(root, paths, jobs, args.samples)
+        rows.append((jobs, elapsed_ms, stats))
 
-    # Threading (GIL-bound, but tree-sitter releases GIL during parse)
-    from concurrent.futures import ThreadPoolExecutor
-    for nw in (2, 4, 8):
-        t0 = time.perf_counter()
-        for _ in range(3):
-            with ThreadPoolExecutor(max_workers=nw) as pool:
-                list(pool.map(extract_one, file_infos))
-        t1 = time.perf_counter()
-        ms = (t1 - t0) / 3 * 1000
-        print(f"Threads ({nw}):        {ms:.1f} ms  ({serial_ms / ms:.1f}x)")
-
-    # Multiprocessing
-    for nw in (2, 4, 8):
-        t0 = time.perf_counter()
-        for _ in range(3):
-            with mp.Pool(nw) as pool:
-                list(pool.map(extract_one, file_infos))
-        t1 = time.perf_counter()
-        ms = (t1 - t0) / 3 * 1000
-        print(f"Processes ({nw}):      {ms:.1f} ms  ({serial_ms / ms:.1f}x)")
+    baseline = rows[0][1]
+    print(f"{'jobs':>4s} {'median ms':>10s} {'speedup':>8s} {'files':>6s} {'nodes':>7s} {'edges':>7s} {'skipped':>8s}")
+    print("-" * 66)
+    for jobs, elapsed_ms, stats in rows:
+        speedup = baseline / elapsed_ms if elapsed_ms else 0.0
+        print(
+            f"{jobs:4d} {elapsed_ms:10.1f} {speedup:8.2f} "
+            f"{stats.files:6d} {stats.nodes_added:7d} {stats.edges_added:7d} {stats.skipped_edges:8d}"
+        )
 
 
 if __name__ == "__main__":

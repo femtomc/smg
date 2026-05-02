@@ -4,6 +4,7 @@
 Profiles every major operation on the smg codebase itself, reports median
 times, and highlights the top latency offenders.
 """
+
 from __future__ import annotations
 
 import statistics
@@ -54,12 +55,12 @@ def main() -> None:
     def _scan():
         fresh = SemGraph()
         scan_paths(fresh, root, paths=[Path("src")])
+
     record("scan", "scan src/", _scan, n=3)
 
     # --- Diff ---
     old = g.clone()
-    old.add_node(Node(name="fake.old", type=NodeType.FUNCTION,
-                       metadata={"content_hash": "aa", "structure_hash": "bb"}))
+    old.add_node(Node(name="fake.old", type=NodeType.FUNCTION, metadata={"content_hash": "aa", "structure_hash": "bb"}))
     record("diff", "diff_graphs", lambda: diff_graphs(old, g), n=50)
 
     # --- Churn ---
@@ -116,7 +117,7 @@ def main() -> None:
     # Top offenders
     print("\n--- Top 3 latency offenders ---")
     for ms, cat, name in results[:3]:
-        print(f"  {name}: {ms:.1f} ms ({ms/total*100:.0f}%)")
+        print(f"  {name}: {ms:.1f} ms ({ms / total * 100:.0f}%)")
 
 
 if __name__ == "__main__":

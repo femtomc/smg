@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+UV=(uv run --with-editable . --extra dev --extra scan)
+
+echo "ruff check..."
+"${UV[@]}" ruff check .
+
+echo "ruff format..."
+"${UV[@]}" ruff format --check .
+
+echo "pyright..."
+"${UV[@]}" python -m pyright
+
+echo "pytest..."
+"${UV[@]}" python -m pytest -q
+
+if command -v zig >/dev/null 2>&1 && [ -d native/src ]; then
+    echo "zig fmt..."
+    zig fmt --check native/src/ native/build.zig
+
+    echo "zig build..."
+    (cd native && zig build)
+fi
+
+if [ ! -d .smg ]; then
+    echo "smg init..."
+    "${UV[@]}" python -m smg init >/dev/null
+fi
+
+echo "smg scan..."
+"${UV[@]}" python -m smg scan src tests --clean --jobs 2 --format json >/dev/null
+
+echo "smg architecture declarations..."
+"${UV[@]}" python - <<'PY'
+from pathlib import Path
+
+from smg.concepts import Concept
+from smg.rules import Rule
+from smg.storage import load_concepts, load_rules, save_concepts, save_rules
+
+root = Path.cwd()
+
+desired_concepts = [
+    Concept(
+        name="analysis",
+        prefixes=["smg.analyze", "smg.graph_metrics", "smg.oo_metrics", "smg.context", "smg.diff", "smg.export", "smg.blame"],
+        sync_points=[
+            "smg.analyze.filter_to_delta",
+            "smg.analyze.run_analysis",
+            "smg.diff.diff_graphs",
+            "smg.diff.load_graph_from_git",
+            "smg.graph_metrics.minimal_cycle",
+        ],
+    ),
+    Concept(name="cli", prefixes=["smg.cli"], sync_points=["smg.cli"]),
+    Concept(
+        name="core",
+        prefixes=["smg.graph", "smg.model", "smg.query", "smg.storage"],
+        sync_points=["smg.graph", "smg.model", "smg.query", "smg.storage"],
+    ),
+    Concept(
+        name="enforce",
+        prefixes=["smg.rules", "smg.rule_expr", "smg.witness", "smg.concepts"],
+        sync_points=["smg.concepts", "smg.concepts.analyze_concepts", "smg.rules.check_all", "smg.rules.check_rule"],
+    ),
+    Concept(
+        name="scan",
+        prefixes=["smg.scan", "smg.langs", "smg.hashing", "smg.metrics"],
+        sync_points=["smg.langs", "smg.scan.changed_files", "smg.scan.scan_paths"],
+    ),
+]
+
+concepts = {concept.name: concept for concept in load_concepts(root)}
+for desired in desired_concepts:
+    current = concepts.get(desired.name)
+    if current is None:
+        concepts[desired.name] = desired
+        continue
+    current.prefixes = sorted(set(current.prefixes) | set(desired.prefixes))
+    current.sync_points = sorted(set(current.sync_points) | set(desired.sync_points))
+save_concepts(list(concepts.values()), root)
+
+rules = {rule.name: rule for rule in load_rules(root)}
+rules.setdefault(
+    "concept-boundaries",
+    Rule(name="concept-boundaries", type="invariant", invariant="concept-boundaries"),
+)
+save_rules(list(rules.values()), root)
+PY
+
+echo "smg validate..."
+"${UV[@]}" python -m smg validate
+
+echo "smg check..."
+"${UV[@]}" python -m smg check --format json
+
+echo "smg analyze..."
+"${UV[@]}" python -m smg analyze --concepts --summary --format json >/dev/null

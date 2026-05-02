@@ -1,33 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# --- Python: lint + format ---
-echo "ruff check..."
-uv run ruff check src/ tests/
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "ruff format..."
-uv run ruff format --check src/ tests/
-
-# --- Python: type check ---
-echo "pyright..."
-uv run pyright src/
-
-# --- Python: tests ---
-echo "pytest..."
-uv run pytest tests/ -x -q
-
-# --- Zig: format + build ---
-if [ -d native/src ]; then
-    echo "zig fmt..."
-    zig fmt --check native/src/
-
-    echo "zig build..."
-    (cd native && zig build)
+if [ -x "$script_dir/validate" ]; then
+    exec "$script_dir/validate"
 fi
 
-# --- smg self-analysis ---
-echo "smg scan..."
-uv run smg scan src/ --clean >/dev/null
-
-echo "smg check..."
-uv run smg check --format json
+repo_root="$(git rev-parse --show-toplevel)"
+exec "$repo_root/scripts/validate"

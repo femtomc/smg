@@ -30,6 +30,7 @@ dev = [
     "hypothesis>=6.151.10",
     "pyright>=1.1.408",
     "pytest>=8.0",
+    "ruff>=0.15.0",
 ]
 
 [build-system]
@@ -42,6 +43,9 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+exclude = [
+    "native/vendor",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
@@ -59,5 +63,4 @@ select = ["E", "F", "W", "I"]
 include = ["src"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
-# Tighten these as the codebase gains null-safety:
-reportOptionalMemberAccess = "warning"
+reportOptionalMemberAccess = "error"

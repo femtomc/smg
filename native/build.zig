@@ -16,23 +16,23 @@ pub fn build(b: *std.Build) void {
     });
 
     // tree-sitter core: compile lib.c (aggregator that includes all src files)
-    lib.addCSourceFile(.{
+    lib.root_module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter/lib/src/lib.c"),
         .flags = &.{ "-std=gnu11", "-D_DEFAULT_SOURCE", "-fvisibility=hidden" },
     });
-    lib.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
-    lib.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
+    lib.root_module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
+    lib.root_module.addIncludePath(b.path("vendor/tree-sitter/lib/src"));
 
     // tree-sitter-python grammar
-    lib.addCSourceFile(.{
+    lib.root_module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-python/src/parser.c"),
         .flags = &.{"-std=c11"},
     });
-    lib.addCSourceFile(.{
+    lib.root_module.addCSourceFile(.{
         .file = b.path("vendor/tree-sitter-python/src/scanner.c"),
         .flags = &.{"-std=c11"},
     });
-    lib.addIncludePath(b.path("vendor/tree-sitter-python/src"));
+    lib.root_module.addIncludePath(b.path("vendor/tree-sitter-python/src"));
 
     // Make tree-sitter headers available to Zig @cImport
     lib.root_module.addIncludePath(b.path("vendor/tree-sitter/lib/include"));

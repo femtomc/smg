@@ -75,12 +75,11 @@ This release ships the baseline architecture workflow plus three additions that
 used to be release candidates:
 
 - Quantified rules via `smg rule add --forall ... --assert ...`
-- Declared concept/group analysis via `smg concept ...` and `smg analyze --concepts`
+- Declared concept/group analysis via `smg concept ...`, `smg analyze --concepts`, and `smg check`
 - Minimal witnesses in `smg check` text and JSON output
 
-The main remaining limitation is explicit: concept analysis is an analysis
-surface, not yet a `smg check` invariant. `smg analyze --concepts` reports
-unsanctioned cross-concept edges, but it does not fail CI on its own.
+Concept declarations can be inspected through `smg analyze --concepts` and
+enforced in CI with `smg rule add boundaries --invariant concept-boundaries`.
 
 ## Contributor workflow
 
@@ -89,6 +88,9 @@ Run these commands from the repo root. `--with-editable .` keeps the CLI and imp
 ```bash
 # Test suite
 uv run --with-editable . --extra dev --extra scan python -m pytest -q
+
+# Lint
+uv run --with-editable . --extra dev --extra scan ruff check src tests
 
 # Type checking
 uv run --with-editable . --extra dev --extra scan python -m pyright
@@ -99,11 +101,14 @@ uv run --with-editable . --extra dev --extra scan python -m pyright
 The reproducible validation command for code changes in this repository is:
 
 ```bash
-uv run --with-editable . --extra dev --extra scan python -m pytest -q
+bash scripts/validate
 ```
 
-When you want to dogfood the architecture workflow on this repository itself,
-refresh the local graph and run:
+The script runs Ruff, Pyright, pytest, optional native Zig checks, and the
+dogfood `smg scan` / `smg check` / `smg analyze --concepts` flow. It also
+ensures this repository's first-party concept declarations and
+`concept-boundaries` rule are present in `.smg/` before running `smg check`.
+To run those architecture checks by hand:
 
 ```bash
 uv run --with-editable . --extra dev --extra scan python -m smg scan src tests --clean
@@ -114,6 +119,22 @@ uv run --with-editable . --extra dev --extra scan python -m smg analyze --concep
 Concept declarations are stored in `.smg/concepts` when you add them locally.
 If that file is absent, `smg analyze --concepts` reports an empty declaration
 set instead of mutating `.smg/graph.jsonl`.
+
+CI runs the same script through `.github/workflows/validate.yml`. Pyright is
+expected to report `0 errors, 0 warnings`; optional-member access is configured
+as an error so nullable tree-sitter and graph lookups stay explicit.
+
+## Scan benchmarking
+
+Use the scan benchmark when changing extraction, resolution, or parallel scan
+behavior:
+
+```bash
+uv run --with-editable . --extra dev --extra scan python benchmarks/bench_mp.py --samples 5 --jobs 1,2,4,8
+```
+
+The benchmark creates a fresh in-memory graph for each sample and reports
+median end-to-end scan time, not just parser extraction time.
 
 ## The graph
 
@@ -126,6 +147,12 @@ There are three ways to populate the graph:
 3. **Both** -- scan for the baseline, then layer on domain-specific relationships (e.g. "tests", "endpoint", custom types).
 
 Every node and edge is tagged with `source: "scan"` or `source: "manual"`. When rescanning, only scan-sourced nodes are cleaned -- manual annotations survive. If a rescan deletes a node that had manual edges, those orphaned edges are reported.
+
+When a scan cannot resolve an extracted edge, the summary reports the skipped
+edge count. JSON output also includes a bounded `skipped_edge_samples` list with
+the source, relationship, target, reason, and category for representative
+skipped edges, so agents can see whether the scan scope is too narrow, a call is
+external, or a resolver needs work.
 
 ### Supported languages
 
@@ -292,7 +319,7 @@ smg blame SemGraph
 smg blame src/smg/graph.py
 ```
 
-For a single entity, it runs `git log -1 -L <start>,<end>:<file>` to find the commit that last modified the entity's line range. For a file, it blames every entity in that file and displays a table sorted by line number. Output is JSON when piped.
+For a single entity, it runs `git log -1 -L <start>,<end>:<file>` to find the commit that last modified the entity's line range. For a file, it blames every entity in that file and displays a table sorted by line number. Use `--format json` for structured output.
 
 ## Context budgeting
 
@@ -309,7 +336,7 @@ The algorithm walks outward from the target:
 3. **2-hop neighbors** -- signature only (the function/class declaration line)
 4. **3-hop neighbors** -- summary only (name, type, file location, docstring)
 
-If the budget fills up at any tier, remaining entries are downgraded to the next level. Output is structured JSON when piped, syntax-highlighted source when in a terminal. The token counter defaults to `len(text) / 4` (~4 chars per token) but is pluggable via the library API.
+If the budget fills up at any tier, remaining entries are downgraded to the next level. Use `--format json` for structured output; the default is compact text in both terminals and pipes. The token counter defaults to `len(text) / 4` (~4 chars per token) but is pluggable via the library API.
 
 ## Architectural constraints
 
@@ -337,10 +364,12 @@ Patterns use `fnmatch` syntax over fully-qualified node names. The optional `[re
 smg rule add acyclic --invariant no-cycles
 smg rule add reachable --invariant no-dead-code --entry-points "main,cli.*"
 smg rule add layered --invariant no-layering-violations
+smg rule add boundaries --invariant concept-boundaries
 ```
 
 | Invariant | What it checks |
 |-----------|---------------|
+| `concept-boundaries` | Declared concepts only communicate through their `--sync-point` prefixes |
 | `no-cycles` | No circular dependencies (Tarjan's SCC) |
 | `no-dead-code` | Every non-entry node has at least one incoming coupling edge |
 | `no-layering-violations` | No back-dependency edges violate topological layering |
@@ -388,14 +417,26 @@ graph to concept-level summaries and cross-concept witnesses.
 smg concept add cli --prefix smg.cli
 smg concept add core --prefix smg.graph --prefix smg.model
 smg concept add core-api --prefix smg.api --sync-point smg.api.boundary
+smg concept sync-point core-api smg.api.public
 smg concept list
 smg analyze --concepts
 ```
 
 Concept declarations live in `.smg/concepts`, not in `.smg/graph.jsonl`. Use
 `--sync-point` to mark node-name prefixes that are allowed to cross a concept
-boundary. The `concepts` section is added to `smg analyze --format json` only
-when `--concepts` is requested.
+boundary, or add one later with `smg concept sync-point NAME PREFIX`. The
+`concepts` section is added to `smg analyze --format json` only when
+`--concepts` is requested.
+
+See [Architecture Concepts](docs/architecture-concepts.md) for the first-party
+calibration workflow and suggested sync-point candidates.
+
+To enforce declared concept boundaries, add the concept invariant:
+
+```bash
+smg rule add boundaries --invariant concept-boundaries
+smg check --format json
+```
 
 ## Agent usage
 
@@ -428,7 +469,8 @@ smg link api.routes calls auth.service
 smg scan --changed                     # incremental rescan
 ```
 
-Output is automatically JSON when piped, rich text in terminal. No flags needed.
+Commands emit compact text by default in both terminals and pipes. Use
+`--format json` or `--json` on commands that support structured output.
 
 ## Commands
 
@@ -481,6 +523,7 @@ Output is automatically JSON when piped, rich text in terminal. No flags needed.
 |---------|---------|
 | `smg init` | Create `.smg/` in current directory |
 | `smg scan [PATH...] [--clean] [--exclude GLOB]` | Auto-populate from source via tree-sitter |
+| `smg scan [PATH...] --jobs N` | Extract files in parallel worker processes, then merge deterministically |
 | `smg scan --changed` | Incremental: rescan files changed since HEAD |
 | `smg scan --since REF` | Incremental: rescan files changed since a git ref |
 | `smg watch [PATH...]` | Auto-rescan on file changes (Ctrl+C to stop) |
@@ -547,7 +590,7 @@ smg show run              # Error if multiple matches -- lists candidates
 
 ### Design principles
 
-- **Agent-first**: JSON by default when piped, structured output, exit codes for branching
+- **Agent-first**: explicit JSON output, compact text defaults, exit codes for branching
 - **Gradual disclosure**: `about` -> `show` -> `query` -- start simple, drill down as needed
 - **Language-agnostic**: tree-sitter grammars for any language, BranchMap protocol for metrics
 - **Incremental**: `--changed` rescans only modified files, `watch` for live updates
