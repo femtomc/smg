@@ -60,6 +60,8 @@ _BUILTINS = frozenset(
     }
 )
 
+_CONSTRUCTOR_FUNCTIONS = frozenset({"init"})
+
 
 class ZigExtractor:
     extensions = [".zig"]
@@ -213,7 +215,8 @@ class ZigExtractor:
         # Extract calls from function body
         body = _find_child(node, "block")
         if body is not None:
-            self._extract_calls(body, qualified, struct_name if is_method else None, edges)
+            receiver_types = self._collect_receiver_types(body)
+            self._extract_calls(body, qualified, struct_name if is_method else None, edges, receiver_types)
 
     def _extract_test(
         self,
@@ -286,12 +289,13 @@ class ZigExtractor:
         caller_name: str,
         struct_name: str | None,
         edges: list[Edge],
+        receiver_types: dict[str, list[str]],
     ) -> None:
         stack: list[TSNode] = [root]
         while stack:
             node = stack.pop()
             if node.type == "call_expression":
-                target = self._call_target(node, struct_name)
+                target = self._call_target(node, struct_name, receiver_types)
                 if target is not None:
                     name, resolved = target
                     edges.append(
@@ -306,7 +310,12 @@ class ZigExtractor:
                 if child.type != "function_declaration":
                     stack.append(child)
 
-    def _call_target(self, call_node: TSNode, struct_name: str | None) -> tuple[str, bool] | None:
+    def _call_target(
+        self,
+        call_node: TSNode,
+        struct_name: str | None,
+        receiver_types: dict[str, list[str]],
+    ) -> tuple[str, bool] | None:
         """Resolve call target from a call_expression node."""
         # call_expression's first child is the function reference
         func = call_node.children[0] if call_node.children else None
@@ -328,6 +337,12 @@ class ZigExtractor:
             if parts[0] == "self" and struct_name and len(parts) == 2:
                 return (f"{struct_name}.{parts[1]}", True)
 
+            # receiver.method() where receiver came from Type.init() or an
+            # explicit type annotation. Keep the target unresolved so the
+            # scanner can bind module aliases and suffixes after all files load.
+            if len(parts) == 2 and parts[0] in receiver_types:
+                return (".".join([*receiver_types[parts[0]], parts[1]]), False)
+
             # Skip std.* calls
             if parts[0] == "std":
                 return None
@@ -343,6 +358,12 @@ class ZigExtractor:
         """Flatten a.b.c field_expression to ['a', 'b', 'c']."""
         if node.type == "identifier":
             return [_node_text(node)]
+        if node.type in ("pointer_type", "optional_type"):
+            parts: list[str] = []
+            for child in node.children:
+                if child.is_named:
+                    parts.extend(self._field_expression_parts(child))
+            return parts
         if node.type == "field_expression":
             parts = []
             for child in node.children:
@@ -350,6 +371,45 @@ class ZigExtractor:
                     parts.extend(self._field_expression_parts(child))
             return parts
         return []
+
+    def _collect_receiver_types(self, body: TSNode) -> dict[str, list[str]]:
+        receiver_types: dict[str, list[str]] = {}
+        stack = [body]
+        while stack:
+            node = stack.pop()
+            if node.type == "variable_declaration":
+                binding = self._receiver_binding(node)
+                if binding is not None:
+                    name, type_parts = binding
+                    receiver_types[name] = type_parts
+            for child in node.children:
+                if child.type != "function_declaration":
+                    stack.append(child)
+        return receiver_types
+
+    def _receiver_binding(self, node: TSNode) -> tuple[str, list[str]] | None:
+        name_node = _variable_name_node(node)
+        if name_node is None:
+            return None
+        type_node = node.child_by_field_name("type")
+        if type_node is not None:
+            type_parts = self._field_expression_parts(type_node)
+            if type_parts:
+                return (_node_text(name_node), type_parts)
+
+        initializer = _variable_initializer_node(node, name_node, type_node)
+        if initializer is None:
+            return None
+        call = _unwrap_expression(initializer)
+        if call is None or call.type != "call_expression" or not call.children:
+            return None
+        func = call.children[0]
+        if func.type != "field_expression":
+            return None
+        parts = self._field_expression_parts(func)
+        if len(parts) < 2 or parts[-1] not in _CONSTRUCTOR_FUNCTIONS:
+            return None
+        return (_node_text(name_node), parts[:-1])
 
     def _has_self_param(self, func_node: TSNode) -> bool:
         params = _find_child(func_node, "parameters")
@@ -368,6 +428,37 @@ def _find_child(node: TSNode, type_name: str) -> TSNode | None:
         if child.type == type_name:
             return child
     return None
+
+
+def _variable_name_node(node: TSNode) -> TSNode | None:
+    for child in node.children:
+        if child.type == "identifier":
+            return child
+    return None
+
+
+def _variable_initializer_node(
+    node: TSNode,
+    name_node: TSNode,
+    type_node: TSNode | None,
+) -> TSNode | None:
+    for child in reversed(node.children):
+        if not child.is_named:
+            continue
+        if child == name_node or child == type_node:
+            continue
+        return child
+    return None
+
+
+def _unwrap_expression(node: TSNode) -> TSNode | None:
+    current = node
+    while current.type in ("try_expression", "catch_expression"):
+        named_children = [child for child in current.children if child.is_named]
+        if not named_children:
+            return None
+        current = named_children[0]
+    return current
 
 
 register(ZigExtractor())

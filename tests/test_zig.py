@@ -2,6 +2,7 @@
 
 import pytest
 
+from smg import query
 from smg.model import NodeType, RelType
 from smg.scan import file_to_module_name, scan_paths
 from smg.storage import init_project, load_graph
@@ -175,6 +176,76 @@ def test_zig_calls_self(tmp_path):
 
 
 @needs_zig
+def test_zig_calls_receiver_from_initializer(tmp_path):
+    root = tmp_path
+    src = root / "src"
+    src.mkdir()
+    (src / "server.zig").write_text("""\
+pub const Server = struct {
+    pub fn init() !Server {
+        return .{};
+    }
+
+    pub fn start(self: *Server) void {
+        _ = self;
+    }
+};
+""")
+    (src / "main.zig").write_text("""\
+const server = @import("server");
+
+pub fn main() !void {
+    var s = try server.Server.init();
+    s.start();
+}
+""")
+    init_project(root)
+    graph = load_graph(root)
+    stats = scan_paths(graph, root, [root / "src"])
+
+    assert stats.skipped_edge_categories == {}
+
+    edges = graph.outgoing("src.main.main", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "src.server.Server.init" in targets
+    assert "src.server.Server.start" in targets
+
+    affected = query.impact(graph, "src.server.Server.start", rel_types=set(query.COUPLING_RELS))
+    assert "src.main.main" in affected
+
+
+@needs_zig
+def test_zig_calls_receiver_from_type_annotation(tmp_path):
+    root = tmp_path
+    src = root / "src"
+    src.mkdir()
+    (src / "server.zig").write_text("""\
+pub const Server = struct {
+    pub fn start(self: *Server) void {
+        _ = self;
+    }
+};
+""")
+    (src / "main.zig").write_text("""\
+const server = @import("server");
+
+pub fn main() void {
+    var s: server.Server = undefined;
+    s.start();
+}
+""")
+    init_project(root)
+    graph = load_graph(root)
+    stats = scan_paths(graph, root, [root / "src"])
+
+    assert stats.skipped_edge_categories == {}
+
+    edges = graph.outgoing("src.main.main", rel=RelType.CALLS)
+    targets = {e.target for e in edges}
+    assert "src.server.Server.start" in targets
+
+
+@needs_zig
 def test_zig_tests_extracted(tmp_path):
     root = _write_zig_project(tmp_path)
     init_project(root)
@@ -195,6 +266,7 @@ def test_zig_metrics(tmp_path):
     scan_paths(graph, root, [root / "src"])
 
     listen = graph.get_node("src.server.Server.listen")
+    assert listen is not None
     assert "metrics" in listen.metadata
     m = listen.metadata["metrics"]
     assert m["cyclomatic_complexity"] >= 3  # if + for
