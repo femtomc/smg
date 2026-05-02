@@ -102,6 +102,8 @@ def test_analyze_concepts_reports_dependencies_and_sync_metrics():
     assert dependency.target == "core"
     assert dependency.edge_count == 2
     assert dependency.rels == {"calls": 2}
+    assert dependency.unsanctioned_count == 1
+    assert dependency.unsanctioned_rels == {"calls": 1}
     assert dependency.allowed_sync is False
     assert dependency.witnesses[0]["edges"][0] == {
         "source": "app.ui.render",
@@ -114,6 +116,15 @@ def test_analyze_concepts_reports_dependencies_and_sync_metrics():
     assert violation.source == "ui"
     assert violation.target == "core"
     assert violation.message == "1 unsanctioned cross-concept edge(s)"
+    assert violation.rels == {"calls": 1}
+    assert violation.sync_candidates == {
+        "source": ["app.ui.render"],
+        "target": ["app.core.compute"],
+    }
+    assert violation.sync_commands == {
+        "source": ["smg concept sync-point ui app.ui.render"],
+        "target": ["smg concept sync-point core app.core.compute"],
+    }
     assert violation.witnesses[0]["edges"][0] == {
         "source": "app.ui.render",
         "rel": "calls",

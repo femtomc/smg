@@ -563,12 +563,16 @@ def diff(ref: str, fmt: str | None) -> None:
     """
     import json as json_mod
 
-    from smg.diff import diff_graphs, load_graph_from_git
+    from smg.diff import GitRefError, diff_graphs, load_graph_from_git
 
     graph, root = _load()
     fmt = _auto_fmt(fmt)
 
-    old_graph = load_graph_from_git(root, ref)
+    try:
+        old_graph = load_graph_from_git(root, ref)
+    except GitRefError as exc:
+        err_console.print(f"[red]Error:[/] {exc}")
+        sys.exit(EXIT_VALIDATION)
     if old_graph is None:
         if fmt == "json":
             # No baseline — treat everything as added
@@ -768,9 +772,13 @@ def analyze(
     # Compute delta names for --since filtering
     delta_names: set[str] | None = None
     if since_ref:
-        from smg.diff import diff_graphs, load_graph_from_git
+        from smg.diff import GitRefError, diff_graphs, load_graph_from_git
 
-        old_graph = load_graph_from_git(_root, since_ref)
+        try:
+            old_graph = load_graph_from_git(_root, since_ref)
+        except GitRefError as exc:
+            err_console.print(f"[red]Error:[/] {exc}")
+            sys.exit(EXIT_VALIDATION)
         if old_graph is None:
             old_graph = SemGraph()
         diff_result = diff_graphs(old_graph, graph)
@@ -972,9 +980,11 @@ def _render_concepts_text(concepts: "ConceptAnalysis", top_n: int) -> None:
             assert isinstance(dependency, dict)
             sync_label = "allowed" if dependency["allowed_sync"] else "unsanctioned"
             rels = ", ".join(f"{rel}={count}" for rel, count in dependency["rels"].items())
+            unsanctioned = int(dependency.get("unsanctioned_count", 0))
+            suffix = f", {unsanctioned} unsanctioned" if unsanctioned else ""
             console.print(
                 f"  {dependency['source']} -> {dependency['target']}"
-                f" [dim]({dependency['edge_count']} edge(s), {rels}, {sync_label})[/]"
+                f" [dim]({dependency['edge_count']} edge(s), {rels}, {sync_label}{suffix})[/]"
             )
             witness = dependency["witnesses"][0]["edges"][0] if dependency["witnesses"] else None
             if witness is not None:
@@ -993,6 +1003,20 @@ def _render_concepts_text(concepts: "ConceptAnalysis", top_n: int) -> None:
                 edge = witness["edges"][0]
                 assert isinstance(edge, dict)
                 console.print(f"      {edge['source']} [dim]--{_rel_style(edge['rel'])}-->[/] {edge['target']}")
+            candidates = violation.get("sync_candidates", {})
+            if isinstance(candidates, dict):
+                sources = candidates.get("source", [])
+                targets = candidates.get("target", [])
+                if sources or targets:
+                    source_text = ", ".join(str(item) for item in sources)
+                    target_text = ", ".join(str(item) for item in targets)
+                    console.print(f"      [dim]sync candidates: source={source_text}; target={target_text}[/]")
+            commands = violation.get("sync_commands", {})
+            if isinstance(commands, dict):
+                command_list = [str(item) for item in commands.get("source", [])[:1]]
+                command_list.extend(str(item) for item in commands.get("target", [])[:1])
+                for command in command_list:
+                    console.print(f"      [dim]try: {command}[/]")
         if len(violations) > top_n:
             console.print(f"  [dim]... and {len(violations) - top_n} more[/]")
 
@@ -1607,14 +1631,18 @@ def search(
 
     effective_json = use_json or fmt == "json"
 
-    hits, total = search_nodes(
-        db_path,
-        query_str,
-        kind=kind_,
-        limit=limit_,
-        graph=graph,
-        root=root,
-    )
+    try:
+        hits, total = search_nodes(
+            db_path,
+            query_str,
+            kind=kind_,
+            limit=limit_,
+            graph=graph,
+            root=root,
+        )
+    except ValueError as exc:
+        err_console.print(f"[red]Error:[/] {exc}")
+        sys.exit(EXIT_VALIDATION)
 
     if json_legacy:
         data = [

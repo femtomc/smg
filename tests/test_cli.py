@@ -533,6 +533,8 @@ def test_analyze_with_concepts_json(tmp_path):
             "target": "utils",
             "edge_count": 2,
             "rels": {"calls": 1, "imports": 1},
+            "unsanctioned_count": 2,
+            "unsanctioned_rels": {"calls": 1, "imports": 1},
             "witnesses": [
                 {
                     "kind": "edge",
@@ -563,6 +565,21 @@ def test_analyze_with_concepts_json(tmp_path):
             "source": "core",
             "target": "utils",
             "message": "2 unsanctioned cross-concept edge(s)",
+            "rels": {"calls": 1, "imports": 1},
+            "sync_candidates": {
+                "source": ["app.core", "app.core.Engine.run"],
+                "target": ["app.utils", "app.utils.helper"],
+            },
+            "sync_commands": {
+                "source": [
+                    "smg concept sync-point core app.core",
+                    "smg concept sync-point core app.core.Engine.run",
+                ],
+                "target": [
+                    "smg concept sync-point utils app.utils",
+                    "smg concept sync-point utils app.utils.helper",
+                ],
+            },
             "witnesses": [
                 {
                     "kind": "edge",
@@ -616,3 +633,21 @@ def test_analyze_with_concepts_summary_json(tmp_path):
     assert [concept["name"] for concept in data["concepts"]["declared"]] == ["core", "utils"]
     assert len(data["concepts"]["dependencies"]) == 1
     assert len(data["concepts"]["violations"]) == 1
+
+
+def test_concept_sync_point_adds_to_existing_concept(tmp_path):
+    runner = _build_sample_graph(tmp_path)
+    runner.invoke(main, ["concept", "add", "core", "--prefix", "app.core"])
+
+    result = runner.invoke(main, ["concept", "sync-point", "core", "app.core.Engine.run"])
+    assert result.exit_code == 0
+    listed = runner.invoke(main, ["concept", "list", "--format", "json"])
+    data = json.loads(listed.output)
+    assert data == [
+        {
+            "kind": "concept",
+            "name": "core",
+            "prefixes": ["app.core"],
+            "sync_points": ["app.core.Engine.run"],
+        }
+    ]

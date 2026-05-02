@@ -90,6 +90,36 @@ def concept_list(fmt: str | None) -> None:
     console.print(table)
 
 
+@concept.command("sync-point")
+@click.argument("name")
+@click.argument("sync_point")
+def concept_sync_point(name: str, sync_point: str) -> None:
+    """Add a sync-point prefix to an existing concept declaration.
+
+    \b
+    Example:
+      smg concept sync-point core app.core.public_api
+    """
+    from smg.storage import load_concepts, save_concepts
+
+    _graph, root = _load()
+    concepts = load_concepts(root)
+    for concept_obj in concepts:
+        if concept_obj.name != name:
+            continue
+        if sync_point not in concept_obj.sync_points:
+            concept_obj.sync_points.append(sync_point)
+            concept_obj.sync_points = sorted(set(concept_obj.sync_points))
+            save_concepts(concepts, root)
+            console.print(f"Concept {name!r} sync point added.")
+        else:
+            console.print(f"Concept {name!r} already has that sync point.")
+        return
+
+    err_console.print(f"[red]Error:[/] concept {name!r} not found.")
+    sys.exit(EXIT_NOT_FOUND)
+
+
 @concept.command("rm")
 @click.argument("name")
 def concept_rm(name: str) -> None:

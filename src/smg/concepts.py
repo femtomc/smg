@@ -109,6 +109,8 @@ class ConceptDependency:
     target: str
     edge_count: int
     rels: dict[str, int]
+    unsanctioned_count: int
+    unsanctioned_rels: dict[str, int]
     witnesses: list[dict[str, object]]
     allowed_sync: bool
 
@@ -118,6 +120,8 @@ class ConceptDependency:
             "target": self.target,
             "edge_count": self.edge_count,
             "rels": self.rels,
+            "unsanctioned_count": self.unsanctioned_count,
+            "unsanctioned_rels": self.unsanctioned_rels,
             "witnesses": self.witnesses,
             "allowed_sync": self.allowed_sync,
         }
@@ -128,6 +132,9 @@ class ConceptViolation:
     source: str
     target: str
     message: str
+    rels: dict[str, int]
+    sync_candidates: dict[str, list[str]]
+    sync_commands: dict[str, list[str]]
     witnesses: list[dict[str, object]]
 
     def to_dict(self) -> dict[str, object]:
@@ -135,6 +142,9 @@ class ConceptViolation:
             "source": self.source,
             "target": self.target,
             "message": self.message,
+            "rels": self.rels,
+            "sync_candidates": self.sync_candidates,
+            "sync_commands": self.sync_commands,
             "witnesses": self.witnesses,
         }
 
@@ -240,6 +250,8 @@ def analyze_concepts(graph: SemGraph, concepts: list[Concept]) -> ConceptAnalysi
                 target=pair[1],
                 edge_count=len(edges),
                 rels=dict(sorted(Counter(edge.rel.value for edge in edges).items())),
+                unsanctioned_count=len(unsanctioned),
+                unsanctioned_rels=dict(sorted(Counter(edge.rel.value for edge in unsanctioned).items())),
                 witnesses=_edge_witnesses(unsanctioned or edges),
                 allowed_sync=not unsanctioned,
             )
@@ -250,6 +262,9 @@ def analyze_concepts(graph: SemGraph, concepts: list[Concept]) -> ConceptAnalysi
                     source=pair[0],
                     target=pair[1],
                     message=f"{len(unsanctioned)} unsanctioned cross-concept edge(s)",
+                    rels=dict(sorted(Counter(edge.rel.value for edge in unsanctioned).items())),
+                    sync_candidates=_sync_candidates(unsanctioned),
+                    sync_commands=_sync_commands(pair[0], pair[1], unsanctioned),
                     witnesses=_edge_witnesses(unsanctioned),
                 )
             )
@@ -290,6 +305,21 @@ def _edge_witnesses(edges: list[Edge], limit: int = 5) -> list[dict[str, object]
         }
         for edge in edges[:limit]
     ]
+
+
+def _sync_candidates(edges: list[Edge], limit: int = 5) -> dict[str, list[str]]:
+    return {
+        "source": _unique([edge.source for edge in edges])[:limit],
+        "target": _unique([edge.target for edge in edges])[:limit],
+    }
+
+
+def _sync_commands(source_concept: str, target_concept: str, edges: list[Edge], limit: int = 5) -> dict[str, list[str]]:
+    candidates = _sync_candidates(edges, limit=limit)
+    return {
+        "source": [f"smg concept sync-point {source_concept} {candidate}" for candidate in candidates["source"]],
+        "target": [f"smg concept sync-point {target_concept} {candidate}" for candidate in candidates["target"]],
+    }
 
 
 def _sync_density(cross_edges: int, touched_edges: int) -> float:
